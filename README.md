@@ -71,7 +71,7 @@ Bridge server bertugas menghubungkan Antigravity IDE ke Coucou Desktop dan HP An
    ```
    Buka file `domain.txt` dan isi dengan domain publik Anda, misalnya:
    ```text
-   coucou.ainu-l.dev
+   coucou.domainanda.com
    ```
 4. Jalankan server bridge:
    ```powershell

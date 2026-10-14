@@ -134,9 +134,12 @@ fn ensure_bridge_running() {
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         candidate_dirs.push(std::path::PathBuf::from(local_app_data).join("Coucou").join("bridge"));
     }
-    candidate_dirs.push(std::path::PathBuf::from(r"C:\Users\ainul\Documents\coucou\coucou-main\windows\bridge"));
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        candidate_dirs.push(std::path::PathBuf::from(user_profile).join("Documents").join("coucou").join("windows").join("bridge"));
+    }
     if let Ok(cwd) = std::env::current_dir() {
         candidate_dirs.push(cwd.join("bridge"));
+        candidate_dirs.push(cwd.join("windows").join("bridge"));
     }
 
     for bridge_dir in candidate_dirs {

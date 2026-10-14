@@ -1,3 +1,4 @@
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "C:\Users\ainul\Documents\coucou\coucou-main\windows\bridge"
+Set Fso = CreateObject("Scripting.FileSystemObject")
+ScriptDir = Fso.GetParentFolderName(WScript.ScriptFullName)
+WshShell.CurrentDirectory = ScriptDir & "\bridge"
 WshShell.Run "node server.js", 0, False

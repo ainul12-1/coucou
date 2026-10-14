@@ -4,5 +4,5 @@ echo Memulai Coucou Antigravity Bridge...
 cd /d "%~dp0bridge"
 start /b "" node server.js
 echo Memulai Coucou Native Notch...
-start "" "C:\Users\ainul\AppData\Local\Coucou\coucou.exe"
+start "" "%LOCALAPPDATA%\Coucou\coucou.exe"
 exit

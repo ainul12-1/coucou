@@ -106,7 +106,7 @@ async function checkPendingApproval() {
 
 const { spawn, exec } = require('child_process');
 const path = require('path');
-const HOOK_EXE = path.join(process.env.LOCALAPPDATA || 'C:\\Users\\ainul\\AppData\\Local', 'Coucou', 'coucou-hook.exe');
+const HOOK_EXE = path.join(process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || 'C:', 'AppData', 'Local'), 'Coucou', 'coucou-hook.exe');
 let activeHookProcess = null;
 let activeApprovalId = null;
 
@@ -805,7 +805,7 @@ const server = http.createServer(async (req, res) => {
     // GET /sessions (List past & current conversations from Antigravity IDE brain)
     if (url.pathname === '/sessions' && req.method === 'GET') {
         try {
-            const brainDir = path.join(process.env.USERPROFILE || 'C:\\Users\\ainul', '.gemini', 'antigravity-ide', 'brain');
+            const brainDir = path.join(process.env.USERPROFILE || os.homedir(), '.gemini', 'antigravity-ide', 'brain');
             if (!fs.existsSync(brainDir)) {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ sessions: [] }));
@@ -862,7 +862,7 @@ const server = http.createServer(async (req, res) => {
         try {
             const parts = url.pathname.split('/');
             const sessionId = parts[2];
-            const logFile = path.join(process.env.USERPROFILE || 'C:\\Users\\ainul', '.gemini', 'antigravity-ide', 'brain', sessionId, '.system_generated', 'logs', 'transcript.jsonl');
+            const logFile = path.join(process.env.USERPROFILE || os.homedir(), '.gemini', 'antigravity-ide', 'brain', sessionId, '.system_generated', 'logs', 'transcript.jsonl');
             if (!fs.existsSync(logFile)) {
                 res.writeHead(404, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ error: 'Session not found' }));
