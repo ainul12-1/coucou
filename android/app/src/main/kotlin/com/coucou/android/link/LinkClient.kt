@@ -87,22 +87,97 @@ interface DesktopLink {
 /** Opens the (TLS) connection to the desktop. Swappable so tests can use plain sockets. */
 fun interface Connector { fun connect(timeoutMs: Int): Socket }
 
+class WsTunnelSocket(private val conn: WsConnection) : Socket() {
+    private val inStream = object : InputStream() {
+        private var cur: ByteArray? = null
+        private var pos = 0
+
+        override fun read(): Int {
+            val b = ByteArray(1)
+            val n = read(b, 0, 1)
+            return if (n <= 0) -1 else (b[0].toInt() and 0xFF)
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            while (cur == null || pos >= cur!!.size) {
+                val msg = conn.receive()
+                when (msg) {
+                    is WsMessage.Binary -> { cur = msg.data; pos = 0 }
+                    is WsMessage.Text -> {
+                        val text = if (msg.text.endsWith("\n")) msg.text else msg.text + "\n"
+                        cur = text.toByteArray(Charsets.UTF_8)
+                        pos = 0
+                    }
+                    is WsMessage.Closed -> return -1
+                }
+            }
+            val remaining = cur!!.size - pos
+            val toRead = minOf(len, remaining)
+            System.arraycopy(cur!!, pos, b, off, toRead)
+            pos += toRead
+            return toRead
+        }
+
+        override fun close() {
+            conn.close()
+        }
+    }
+
+    private val outStream = object : ByteArrayOutputStream() {
+        override fun flush() {
+            val bytes = toByteArray()
+            reset()
+            if (bytes.isNotEmpty()) {
+                conn.sendBinary(bytes)
+            }
+        }
+
+        override fun close() {
+            flush()
+            conn.close()
+        }
+    }
+
+    override fun getInputStream(): InputStream = inStream
+    override fun getOutputStream(): OutputStream = outStream
+    override fun close() = conn.close()
+    override fun isClosed(): Boolean = false
+    override fun isConnected(): Boolean = true
+    override fun setSoTimeout(timeout: Int) { conn.setReadTimeout(timeout) }
+    override fun setTcpNoDelay(on: Boolean) {}
+    override fun setKeepAlive(on: Boolean) {}
+}
+
 object PinnedTls {
     private const val HANDSHAKE_TIMEOUT_MS = 10_000
 
     fun connector(p: PairingPayload) = Connector { timeoutMs ->
         val isDomain = p.host.contains(".") && !p.host.matches(Regex("""^(\d{1,3}\.){3}\d{1,3}$"""))
-        val ctx = SSLContext.getInstance("TLS").apply {
-            val tm = if (p.port == 443 || isDomain) null else arrayOf(PinnedTrustManager(p.certSha256))
-            init(null, tm, SecureRandom())
+        if (p.port == 443 || isDomain) {
+            val relayUrl = RelayUrl(tls = (p.port == 443), host = p.host, port = p.port)
+            val wsConn = WsClient.open(
+                url = relayUrl,
+                path = "/link",
+                headers = emptyList(),
+                protocols = emptyList(),
+                connectTimeoutMs = timeoutMs,
+                maxMessage = 1024 * 1024
+            )
+            WsTunnelSocket(wsConn)
+        } else {
+            val ctx = SSLContext.getInstance("TLS").apply {
+                val tm = arrayOf(PinnedTrustManager(p.certSha256))
+                init(null, tm, SecureRandom())
+            }
+            val raw = Socket()
+            raw.connect(InetSocketAddress(p.host, p.port), timeoutMs)
+            val tls = ctx.socketFactory.createSocket(raw, p.host, p.port, true) as javax.net.ssl.SSLSocket
+            tls.enabledProtocols = tls.supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
+            tls.soTimeout = HANDSHAKE_TIMEOUT_MS // the TCP connect above is quick (a wrong address must fail fast); the handshake gets longer
+            tls.startHandshake()
+            tls
         }
-        val raw = Socket()
-        raw.connect(InetSocketAddress(p.host, p.port), timeoutMs)
-        val tls = ctx.socketFactory.createSocket(raw, p.host, p.port, true) as javax.net.ssl.SSLSocket
-        tls.enabledProtocols = tls.supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
-        tls.soTimeout = HANDSHAKE_TIMEOUT_MS // the TCP connect above is quick (a wrong address must fail fast); the handshake gets longer
-        tls.startHandshake()
-        tls
     }
 }
 

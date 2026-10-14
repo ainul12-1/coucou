@@ -7,7 +7,7 @@ import { N_ } from "../i18n/i18n";
 
 export type ProviderId =
   | "anthropic" | "openai" | "google" | "openrouter"
-  | "ollama" | "lmstudio" | "custom";
+  | "ollama" | "lmstudio" | "custom" | "antigravity";
 
 export interface ProviderDef {
   id: ProviderId;
@@ -31,6 +31,7 @@ export const PROVIDERS: readonly ProviderDef[] = [
   { id: "ollama", name: "Ollama", accent: "#FACC15", key: null, urlField: "ollamaUrl", defaultModel: "", prefer: null },
   { id: "lmstudio", name: "LM Studio", accent: "#A3E635", key: null, urlField: "lmstudioUrl", defaultModel: "", prefer: null },
   { id: "custom", name: N_("Custom server"), accent: "#38BDF8", key: null, urlField: "customUrl", defaultModel: "", prefer: null },
+  { id: "antigravity", name: "Antigravity IDE", accent: "#9333EA", key: null, urlField: null, defaultModel: "agent", prefer: null },
 ];
 
 /** Credential store entry of the custom server's optional key. */

@@ -1,4 +1,6 @@
 const http = require('http');
+const tls = require('tls');
+const WebSocket = require('ws');
 const { sendViaCDP, resolveTargets } = require('./cdp_controller');
 const OriginalCDP = require('chrome-remote-interface');
 const QRCode = require('qrcode');
@@ -676,6 +678,23 @@ const server = http.createServer(async (req, res) => {
         return res.end(latestScreenshotBuffer);
     }
 
+    // GET /apk or /coucou.apk (Download updated Android APK with WebSocket Tunnel)
+    if (url.pathname === '/apk' || url.pathname === '/coucou.apk' || url.pathname === '/app-debug.apk') {
+        const apkPath = path.join(__dirname, '..', '..', 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+        if (!fs.existsSync(apkPath)) {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end('APK belum siap.');
+        }
+        const stat = fs.statSync(apkPath);
+        res.writeHead(200, {
+            'Content-Type': 'application/vnd.android.package-archive',
+            'Content-Length': stat.size,
+            'Content-Disposition': 'attachment; filename="coucou.apk"'
+        });
+        const stream = fs.createReadStream(apkPath);
+        return stream.pipe(res);
+    }
+
     // POST /upload (Photo upload from Coucou Android - supports up to 5 photos)
     if (url.pathname === '/upload' && req.method === 'POST') {
         res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1220,3 +1239,59 @@ server.listen(PORT, '0.0.0.0', () => {
     // Start approval poller
     setInterval(checkPendingApproval, 1500);
 });
+
+// WebSocket Tunnel for Cloudflare Phone Link -> Coucou Desktop TLS (Port 47821)
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+    try {
+        const parsed = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+        if (parsed.pathname === '/link' || parsed.pathname === '/ws/link' || parsed.pathname === '/') {
+            wss.handleUpgrade(request, socket, head, (ws) => {
+                wss.emit('connection', ws, request);
+            });
+        } else {
+            socket.destroy();
+        }
+    } catch (_) {
+        socket.destroy();
+    }
+});
+
+wss.on('connection', (ws, req) => {
+    console.log('[Bridge WS] Phone connected via WebSocket Tunnel!');
+    const desktopTls = tls.connect(47821, '127.0.0.1', { rejectUnauthorized: false }, () => {
+        console.log('[Bridge WS] Connected to Coucou Desktop TLS port 47821');
+    });
+
+    desktopTls.on('data', (chunk) => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(chunk);
+        }
+    });
+
+    ws.on('message', (data) => {
+        desktopTls.write(data);
+    });
+
+    ws.on('close', () => {
+        console.log('[Bridge WS] Phone WebSocket closed');
+        desktopTls.end();
+    });
+
+    desktopTls.on('close', () => {
+        console.log('[Bridge WS] Coucou Desktop TLS closed');
+        ws.close();
+    });
+
+    desktopTls.on('error', (err) => {
+        console.error('[Bridge WS] Desktop TLS error:', err.message);
+        ws.close();
+    });
+
+    ws.on('error', (err) => {
+        console.error('[Bridge WS] Phone WS error:', err.message);
+        desktopTls.end();
+    });
+});
+
