@@ -599,7 +599,7 @@ type LocalId = "ollama" | "lmstudio" | "custom";
 let localRedraw: (() => void) | null = null;
 
 const LOCAL: Record<LocalId, { name: string; usual: string }> = {
-  custom: { name: "Google Antigravity IDE", usual: "http://127.0.0.1:9335" },
+  custom: { name: N_("OpenAI-compatible"), usual: "http://127.0.0.1:9335" },
   ollama: { name: "Ollama", usual: "http://127.0.0.1:11434" },
   lmstudio: { name: "LM Studio", usual: "http://127.0.0.1:1234" },
 };
