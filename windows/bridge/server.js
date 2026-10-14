@@ -607,8 +607,8 @@ async function handleChatPrompt(promptText, port) {
     // 2. Type & send message into Antigravity IDE composer
     await sendViaCDP(promptText, port);
 
-    // 3. Wait & poll for real AI response in transcript (up to 80 seconds)
-    const MAX_WAIT_MS = 80000;
+    // 3. Wait & poll for real AI response in transcript (up to 18 seconds to prevent phone timeout)
+    const MAX_WAIT_MS = 18000;
     const POLL_INTERVAL = 1000;
     const startTime = Date.now();
 
@@ -623,7 +623,7 @@ async function handleChatPrompt(promptText, port) {
     }
 
     // If still generating or timeout reached
-    return `[PROSES] **Pesan telah dikirim ke Antigravity IDE dan masih diproses.**\n\nJika proses membutuhkan waktu lebih lama, ketik \`/latest\` kapan saja untuk menarik jawaban AI begitu selesai, atau ketik \`/ss\` untuk melihat layar!`;
+    return `[PROSES] Pesan telah dikirim ke Antigravity IDE dan sedang diproses agen di PC.\n\nKetik /latest kapan saja untuk melihat jawaban lengkap setelah selesai, atau ketik /ss untuk melihat tangkapan layar.`;
 }
 
 // Capture screenshot of Antigravity IDE
@@ -1046,8 +1046,12 @@ const server = http.createServer(async (req, res) => {
 
                 const port = await detectCdpPort();
                 if (!port) {
-                    res.writeHead(503, { 'Content-Type': 'application/json' });
-                    return res.end(JSON.stringify({ error: 'Antigravity IDE is not running with --remote-debugging-port' }));
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({
+                        success: true,
+                        text: '[INFO] Antigravity IDE belum terhubung di port 9334. Pastikan Antigravity IDE sudah dibuka di PC Anda.',
+                        message: '[INFO] Antigravity IDE belum terhubung di port 9334. Pastikan Antigravity IDE sudah dibuka di PC Anda.'
+                    }));
                 }
 
                 const replyText = await handleChatPrompt(text, port);
