@@ -2,6 +2,7 @@ const http = require('http');
 const { sendViaCDP, resolveTargets } = require('./cdp_controller');
 const OriginalCDP = require('chrome-remote-interface');
 const QRCode = require('qrcode');
+const tunnelManager = require('./tunnel_manager');
 
 const PORT = 9335;
 const CDP_PORTS = [9334, 9333]; // 9334 = IDE, 9333 = Standalone
@@ -771,11 +772,46 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
-    // GET /domain (Return current configured public domain)
+    // GET /domain (Return current configured public domain or active Quick Tunnel)
     if (url.pathname === '/domain' && req.method === 'GET') {
-        const pubHost = publicBaseUrl ? publicBaseUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '') : null;
+        const tunnelStatus = tunnelManager.getStatus();
+        const activeUrl = publicBaseUrl || tunnelStatus.url;
+        const pubHost = activeUrl ? activeUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '') : null;
         res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-        return res.end(JSON.stringify({ domain: pubHost, url: publicBaseUrl }));
+        return res.end(JSON.stringify({
+            domain: pubHost,
+            url: activeUrl,
+            isQuick: !publicBaseUrl && !!tunnelStatus.url,
+            tunnel: tunnelStatus
+        }));
+    }
+
+    // GET /tunnel/status
+    if (url.pathname === '/tunnel/status' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        return res.end(JSON.stringify({
+            ...tunnelManager.getStatus(),
+            configuredDomain: publicBaseUrl
+        }));
+    }
+
+    // POST /tunnel/start
+    if (url.pathname === '/tunnel/start' && req.method === 'POST') {
+        try {
+            const resData = await tunnelManager.startQuickTunnel(9335);
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            return res.end(JSON.stringify({ success: true, ...resData }));
+        } catch (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            return res.end(JSON.stringify({ success: false, error: err.message }));
+        }
+    }
+
+    // POST /tunnel/stop
+    if (url.pathname === '/tunnel/stop' && req.method === 'POST') {
+        const resData = tunnelManager.stopTunnel();
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        return res.end(JSON.stringify({ success: true, ...resData }));
     }
 
     // GET /health

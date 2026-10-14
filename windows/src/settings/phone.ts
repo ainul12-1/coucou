@@ -490,6 +490,8 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
   let publicDomain: string | null = pairing.publicHost || null;
   let publicLinkText: string | null = pairing.publicLink || null;
   let publicQrSvgText: string | null = pairing.publicQrSvg || null;
+  let isQuickTunnelRunning = false;
+  let quickTunnelLoading = false;
 
   // Extract fp, token, name from pairing.link
   let fp = "";
@@ -514,19 +516,6 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
     if (activeTab === "public") renderActive();
   };
 
-  // Check localStorage for saved public domain first, then fallback to bridge /domain
-  const savedDomain = typeof localStorage !== "undefined" ? localStorage.getItem("coucou_public_domain") : null;
-  if (savedDomain) {
-    void generatePublicQr(savedDomain);
-  } else if (!publicLinkText) {
-    void fetch("http://127.0.0.1:9335/domain")
-      .then(res => res.json())
-      .then(data => {
-        if (data && data.domain) void generatePublicQr(data.domain);
-      })
-      .catch(() => {});
-  }
-
   const qr = h("div", { class: "qr" });
   const link = h("input", { type: "text", readonly: "true", style: "width:100%" }) as HTMLInputElement;
   link.addEventListener("focus", () => link.select());
@@ -535,27 +524,170 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
   const copy = h("button", { text: t("Copy link") });
   const copied = copyLinkHint();
 
-  const tabLocal = h("button", { text: "Lokal (Wi-Fi)", style: "flex:1;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer" });
-  const tabPublic = h("button", { text: "Publik (Cloudflare)", style: "flex:1;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer" });
+  const tabLocal = h("button", { text: "Lokal (Wi-Fi)", style: "flex:1;font-weight:600;padding:8px 14px;border-radius:6px;cursor:pointer;transition:all 0.2s" });
+  const tabPublic = h("button", { text: "Publik (Cloudflare)", style: "flex:1;font-weight:600;padding:8px 14px;border-radius:6px;cursor:pointer;transition:all 0.2s" });
 
-  // Direct domain input row for non-technical users
+  // Quick Tunnel UI elements
+  const tunnelStatusDot = h("span", {
+    style: "display:inline-block;width:9px;height:9px;border-radius:50%;background:#64748b;margin-right:8px;flex-shrink:0"
+  });
+  const tunnelStatusText = h("span", {
+    text: "Quick Tunnel: Tidak aktif",
+    style: "font-size:12.5px;color:#94a3b8;font-weight:500;word-break:break-all"
+  });
+  const tunnelStatusRow = h("div", {
+    style: "display:flex;align-items:center;margin-bottom:8px"
+  }, tunnelStatusDot, tunnelStatusText);
+
+  const tunnelToggleBtn = h("button", {
+    class: "primary",
+    text: "Aktifkan Quick Tunnel Otomatis (Gratis)",
+    style: "width:100%;padding:9px 16px;font-weight:600;font-size:13px;cursor:pointer;border-radius:6px"
+  });
+
+  const tunnelDesc = h("div", {
+    class: "hint",
+    text: "Membuat tunnel publik gratis dari Cloudflare tanpa perlu beli domain atau daftar akun. Link publik acak akan langsung aktif untuk HP Anda di jaringan seluler.",
+    style: "font-size:11.5px;line-height:1.4;margin-top:6px;color:#94a3b8"
+  });
+
+  // Custom domain elements
+  const customDivider = h("div", {
+    style: "margin:14px 0 10px;text-align:center;position:relative"
+  },
+    h("span", {
+      text: "ATAU GUNAKAN DOMAIN SENDIRI",
+      style: "background:#1e293b;padding:0 8px;font-size:10.5px;letter-spacing:0.5px;color:#64748b;font-weight:700"
+    })
+  );
+
   const domainInput = h("input", {
     type: "text",
-    placeholder: "Ketik domain Cloudflare (misal: coucou.namasaya.com)",
-    value: publicDomain || savedDomain || "",
-    style: "flex:1 1 auto;min-width:0;padding:6px 10px;border-radius:6px;background:#0f172a;border:1px solid #334155;color:#f8fafc;font-size:12.5px"
+    placeholder: "Domain Cloudflare kustom (misal: coucou.domainanda.com)",
+    value: "",
+    style: "flex:1 1 auto;min-width:0;padding:7px 10px;border-radius:6px;background:#0f172a;border:1px solid #334155;color:#f8fafc;font-size:12px"
   }) as HTMLInputElement;
 
   const domainApplyBtn = h("button", {
-    class: "primary",
-    text: "Terapkan & Buat QR",
-    style: "padding:6px 14px;font-weight:600;white-space:nowrap"
+    text: "Terapkan Domain",
+    style: "padding:7px 12px;font-weight:600;white-space:nowrap;font-size:12px;cursor:pointer"
   });
 
   const domainRow = h("div", {
     class: "row",
-    style: "display:none;gap:8px;margin-top:6px;margin-bottom:6px"
+    style: "gap:8px;margin:0 0 6px 0"
   }, domainInput, domainApplyBtn);
+
+  const publicControlsCard = h("div", {
+    style: "display:none;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px;margin:6px 0 12px 0"
+  },
+    tunnelStatusRow,
+    tunnelToggleBtn,
+    tunnelDesc,
+    customDivider,
+    domainRow
+  );
+
+  const checkTunnelStatus = async () => {
+    try {
+      const res = await fetch("http://127.0.0.1:9335/tunnel/status");
+      const data = await res.json();
+      if (data && data.running && data.host) {
+        isQuickTunnelRunning = true;
+        tunnelStatusDot.style.background = "#10b981";
+        tunnelStatusText.textContent = `Quick Tunnel Aktif: https://${data.host}`;
+        tunnelStatusText.style.color = "#34d399";
+        tunnelToggleBtn.textContent = "Matikan Quick Tunnel";
+        tunnelToggleBtn.style.background = "#7f1d1d";
+        tunnelToggleBtn.style.color = "#fecaca";
+        tunnelToggleBtn.style.border = "1px solid #dc2626";
+        void generatePublicQr(data.host);
+      } else {
+        isQuickTunnelRunning = false;
+        tunnelStatusDot.style.background = "#64748b";
+        tunnelStatusText.textContent = "Quick Tunnel: Tidak aktif";
+        tunnelStatusText.style.color = "#94a3b8";
+        tunnelToggleBtn.textContent = "Aktifkan Quick Tunnel Otomatis (Gratis)";
+        tunnelToggleBtn.style.background = "";
+        tunnelToggleBtn.style.color = "";
+        tunnelToggleBtn.style.border = "";
+
+        // Check saved domain or bridge configured domain
+        const savedDomain = typeof localStorage !== "undefined" ? localStorage.getItem("coucou_public_domain") : null;
+        if (savedDomain) {
+          domainInput.value = savedDomain;
+          void generatePublicQr(savedDomain);
+        } else if (data && data.configuredDomain) {
+          const host = data.configuredDomain.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+          domainInput.value = host;
+          void generatePublicQr(host);
+        }
+      }
+    } catch (_) {}
+  };
+
+  tunnelToggleBtn.addEventListener("click", async () => {
+    if (quickTunnelLoading) return;
+    quickTunnelLoading = true;
+    tunnelToggleBtn.disabled = true;
+
+    if (!isQuickTunnelRunning) {
+      tunnelStatusDot.style.background = "#f59e0b";
+      tunnelStatusText.textContent = "Mempersiapkan Cloudflare Quick Tunnel...";
+      tunnelStatusText.style.color = "#fbbf24";
+      tunnelToggleBtn.textContent = "Menghubungkan ke Cloudflare...";
+
+      try {
+        const res = await fetch("http://127.0.0.1:9335/tunnel/start", { method: "POST" });
+        const data = await res.json();
+        if (data && data.success && data.host) {
+          isQuickTunnelRunning = true;
+          tunnelStatusDot.style.background = "#10b981";
+          tunnelStatusText.textContent = `Quick Tunnel Aktif: https://${data.host}`;
+          tunnelStatusText.style.color = "#34d399";
+          tunnelToggleBtn.textContent = "Matikan Quick Tunnel";
+          tunnelToggleBtn.style.background = "#7f1d1d";
+          tunnelToggleBtn.style.color = "#fecaca";
+          tunnelToggleBtn.style.border = "1px solid #dc2626";
+          void generatePublicQr(data.host);
+        } else {
+          tunnelStatusText.textContent = data.error || "Gagal mengaktifkan Quick Tunnel";
+          tunnelStatusText.style.color = "#ef4444";
+          tunnelToggleBtn.textContent = "Aktifkan Quick Tunnel Otomatis (Gratis)";
+        }
+      } catch (err) {
+        tunnelStatusText.textContent = `Koneksi gagal: ${String(err)}`;
+        tunnelStatusText.style.color = "#ef4444";
+        tunnelToggleBtn.textContent = "Aktifkan Quick Tunnel Otomatis (Gratis)";
+      }
+    } else {
+      tunnelStatusText.textContent = "Menghentikan Quick Tunnel...";
+      try {
+        await fetch("http://127.0.0.1:9335/tunnel/stop", { method: "POST" });
+        isQuickTunnelRunning = false;
+        tunnelStatusDot.style.background = "#64748b";
+        tunnelStatusText.textContent = "Quick Tunnel: Tidak aktif";
+        tunnelStatusText.style.color = "#94a3b8";
+        tunnelToggleBtn.textContent = "Aktifkan Quick Tunnel Otomatis (Gratis)";
+        tunnelToggleBtn.style.background = "";
+        tunnelToggleBtn.style.color = "";
+        tunnelToggleBtn.style.border = "";
+
+        const savedDomain = typeof localStorage !== "undefined" ? localStorage.getItem("coucou_public_domain") : null;
+        if (savedDomain) {
+          void generatePublicQr(savedDomain);
+        } else {
+          publicDomain = null;
+          publicLinkText = null;
+          publicQrSvgText = null;
+          renderActive();
+        }
+      } catch (_) {}
+    }
+
+    quickTunnelLoading = false;
+    tunnelToggleBtn.disabled = false;
+  });
 
   domainApplyBtn.addEventListener("click", () => {
     let val = domainInput.value.trim();
@@ -574,7 +706,7 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
       tabPublic.style.background = "#1e293b";
       tabPublic.style.color = "#94a3b8";
       tabPublic.style.border = "1px solid #334155";
-      domainRow.style.display = "none";
+      publicControlsCard.style.display = "none";
 
       qr.innerHTML = pairing.qrSvg;
       link.value = pairing.link;
@@ -586,16 +718,16 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
       tabPublic.style.background = "#2563eb";
       tabPublic.style.color = "#ffffff";
       tabPublic.style.border = "1px solid #3b82f6";
-      domainRow.style.display = "flex";
+      publicControlsCard.style.display = "block";
 
       if (publicLinkText && publicQrSvgText) {
         qr.innerHTML = publicQrSvgText;
         link.value = publicLinkText;
         hintText.textContent = `Mode Publik: Gunakan saat di luar rumah via Cloudflare (${publicDomain}:443).`;
       } else {
-        qr.innerHTML = `<div style="padding:32px 16px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.5">Masukkan alamat domain Cloudflare Tunnel Anda pada kotak di bawah ini, lalu klik "Terapkan & Buat QR".</div>`;
+        qr.innerHTML = `<div style="padding:32px 16px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.5">Klik tombol "Aktifkan Quick Tunnel Otomatis (Gratis)" di atas atau masukkan domain Cloudflare sendiri untuk membuat QR Code.</div>`;
         link.value = "";
-        hintText.textContent = "Ketik domain publik Anda di bawah untuk mengaktifkan QR Publik.";
+        hintText.textContent = "Aktifkan Quick Tunnel atau ketik domain publik untuk mulai pairing.";
       }
     }
   };
@@ -608,6 +740,7 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
   tabPublic.addEventListener("click", () => {
     activeTab = "public";
     renderActive();
+    void checkTunnelStatus();
   });
 
   copy.addEventListener("click", () => {
@@ -622,6 +755,8 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
   const repair = h("button", { text: t("Pair again") });
   repair.addEventListener("click", again);
 
+  // Initial check in background
+  void checkTunnelStatus();
   renderActive();
 
   const tabsRow = h("div", { class: "row", style: "display:flex;gap:8px;margin-bottom:8px" }, tabLocal, tabPublic);
@@ -629,12 +764,13 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
   return [
     h("div", { class: "hint", text: t("In Coucou for Android, scan this code with the camera or paste the link.") }),
     tabsRow,
+    publicControlsCard,
     hintText,
     qr,
-    domainRow,
     h("div", { class: "row" }, link, copy),
     copied,
     ...(pairing.relay ? [h("div", { class: "hint", text: t("This code also carries the access key and the end-to-end key for the relay {host}. Pair again makes a new key and a new room.", { host: pairing.relay }) })] : []),
     h("div", { class: "row" }, repair, h("span", { class: "hint", text: t("The phone that was paired is disconnected and needs the new code.") })),
   ];
 }
+
