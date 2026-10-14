@@ -31,7 +31,7 @@ export function toggleModel(allowed: readonly string[], id: string, on: boolean)
  * set. `hasKey` maps a provider id to "its key is saved".
  */
 export function usableProviders(settings: Settings, hasKey: Readonly<Record<string, boolean>>): ProviderDef[] {
-  return PROVIDERS.filter((p) => p.id === "antigravity" || (p.key ? hasKey[p.id] === true : p.urlField !== null && settings[p.urlField] !== ""));
+  return PROVIDERS.filter((p) => (p.key ? hasKey[p.id] === true : p.urlField !== null && settings[p.urlField] !== ""));
 }
 
 /** The ids of `allowed` that belong to `provider`, without the provider part. */
