@@ -1,8 +1,18 @@
+<div align="center">
+
+<img src="NotchBuddy/Assets.xcassets/AppIcon.appiconset/icon_256x256.png" width="96" alt="Coucou icon">
+
 # Coucou untuk Google Antigravity IDE
 
-Companion Notch desktop (Mochi) dan remote controller Android yang terintegrasi langsung dengan Google Antigravity IDE, Claude Code, dan berbagai AI coding agents secara real-time.
+**Companion Notch desktop (Mochi) dan remote controller Android yang terintegrasi langsung dengan Google Antigravity IDE, Claude Code, dan berbagai AI coding agents secara real-time.**
 
 Aplikasi ini menghadirkan interaksi AI agent langsung ke notch atas layar Windows dan ponsel Android: memantau aktivitas coding, menyetujui (approve/deny) izin tool eksekusi, merespons pertanyaan agent, melihat diff perubahan berkas, hingga mengirim prompt baru dari jarak jauh via Wi-Fi lokal maupun Cloudflare Tunnel publik.
+
+<br>
+
+<img src="docs/media/demo.gif" width="760" alt="Coucou Antigravity Demo">
+
+</div>
 
 ---
 
