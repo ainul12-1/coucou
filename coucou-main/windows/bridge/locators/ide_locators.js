@@ -1,0 +1,407 @@
+const IDE_LOCATORS_SCRIPT = `
+    var AG_UI = {
+        openHistoryPopup: () => {
+            const existing = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
+            if (existing) return "already-open";
+            
+            const icon = document.querySelector("[data-past-conversations-toggle='true'], [data-tooltip-id='history-tooltip'], [data-tooltip-id*='history' i], button[aria-label*='history' i], a[aria-label*='history' i], [role='button'][aria-label*='history' i], button[aria-label*='conversation' i], a[aria-label*='conversation' i], button[title*='Recent Sessions' i], a[title*='Recent Sessions' i], svg.lucide-history, .codicon-history");
+            if (!icon) return "no-icon";
+            (icon.closest("button") || icon.closest("a") || icon.parentElement || icon).click();
+            return "opened";
+        },
+        clickShowMoreInPopup: () => {
+            const showMoreEls = Array.from(document.querySelectorAll('[id^="fastpick-show-more-"], [id*="show-more"]'));
+            if (showMoreEls.length === 0) {
+                const textMatches = Array.from(document.querySelectorAll('div')).filter(d => /^show\\s+\\d+\\s+more/i.test(d.textContent.trim()));
+                textMatches.forEach(el => el.click());
+            } else {
+                showMoreEls.forEach(el => el.click());
+            }
+        },
+        closeHistoryPopup: () => {
+            document.body.click();
+            const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
+            document.activeElement.dispatchEvent(esc);
+            document.dispatchEvent(esc);
+        },
+        checkForQuestion: () => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const s = window.getComputedStyle(el);
+                return s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const isExcluded = (el) => !!el.closest('.titlebar, .monaco-workbench .menubar, .monaco-workbench .statusbar, .monaco-workbench .activitybar, .monaco-editor, .editor-widget, .find-widget, .quick-input-widget, .monaco-menu-container, .context-view, .tabs-container, .monaco-action-bar, .actions-container');
+
+            const allRadios = Array.from(document.querySelectorAll('[role="radio"], input[type="radio"]')).filter(el => isVisible(el) && !isExcluded(el));
+            const allCheckboxes = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]')).filter(el => isVisible(el) && !isExcluded(el));
+            const interactiveElements = [...allRadios, ...allCheckboxes];
+
+            let container = null;
+            if (interactiveElements.length > 0) {
+                // First try standard container selectors
+                container = interactiveElements[0].closest('form, fieldset, [role="dialog"], .modal, [class*="rounded"], div.p-4, div.p-3, div.p-2, div.border');
+                
+                // If not found, find the common ancestor of all radio/checkbox elements
+                if (!container && interactiveElements.length > 1) {
+                    let ancestor = interactiveElements[0].parentElement;
+                    while (ancestor && ancestor !== document.body) {
+                        if (interactiveElements.every(el => ancestor.contains(el))) {
+                            container = ancestor;
+                            break;
+                        }
+                        ancestor = ancestor.parentElement;
+                    }
+                }
+                
+                // Last resort: grandparent
+                if (!container) {
+                    container = interactiveElements[0].parentElement?.parentElement?.parentElement ||
+                                interactiveElements[0].parentElement;
+                }
+            }
+
+            if (!container) {
+                const allContainers = Array.from(document.querySelectorAll('.modal, [role="dialog"], .interactive-session, [data-testid*="interactive-modal"], [data-testid*="question"]')).filter(c => isVisible(c) && !isExcluded(c));
+                container = allContainers[0] || null;
+            }
+
+            if (!container) {
+                const allBtns = Array.from(document.querySelectorAll('button, [role="button"], a, div[class*="cursor-pointer"]')).filter(b => isVisible(b) && !isExcluded(b));
+                const submitBtn = allBtns.find(b => {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    return t === 'submit' || t === 'skip' || t === 'gönder' || t === 'atla' || t === 'proceed' || t === 'onayla';
+                });
+                if (submitBtn) {
+                    container = submitBtn.closest('form, fieldset, [class*="rounded"], div.p-4, div.p-3, div.border') || submitBtn.parentElement?.parentElement;
+                }
+            }
+
+            if (!container) return null;
+
+            const isModal = interactiveElements.length > 0 || !!container.querySelector('textarea, input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], select, button');
+            if (!isModal) return null;
+            
+            let headerEl = container.querySelector('.modal-header, [data-testid*="interactive-modal"] h2, [data-testid*="modal"] h2, h2, h3.font-medium, h3, h4, fieldset legend, .font-semibold, .font-medium');
+            let header = (headerEl && headerEl.textContent.trim());
+            
+            const optionCandidateEls = Array.from(container.querySelectorAll(
+                'label, [role="radio"], [role="checkbox"], input[type="radio"], input[type="checkbox"], [data-testid*="option"], div[class*="cursor-pointer"], li'
+            )).filter(el => isVisible(el) && !isExcluded(el));
+
+            let options = [];
+            for (const el of (interactiveElements.length > 0 ? interactiveElements : optionCandidateEls)) {
+                let txt = (el.innerText || el.textContent || '').trim();
+                if (!txt || txt.length <= 2) {
+                    const row = el.closest('label, div.flex, li, [role="button"]') || el.parentElement;
+                    txt = (row?.innerText || row?.textContent || '').trim();
+                }
+                if (!txt) {
+                    txt = el.getAttribute('aria-label') || el.getAttribute('value') || '';
+                }
+                txt = txt.replace(/^[0-9]+[\\s.)\\-]+/, '').replace(/\\b\\(Recommended\\)\\b/gi, '').trim();
+                if (txt && !txt.match(/^(Other|Other \\(write your answer\\)|Other \\(write in\\)|Diğer|Submit|Skip|Gönder|Atla|\\d+)$/i)) {
+                    if (!options.includes(txt)) options.push(txt);
+                }
+            }
+            options = [...new Set(options)];
+            
+            const writeInEl = container.querySelector('textarea:not([disabled]), input[type="text"]:not([disabled])');
+            const hasWriteIn = !!writeInEl;
+            
+            if (options.length === 0 && !hasWriteIn) {
+                if (!header) {
+                    const pTags = Array.from(container.querySelectorAll('p, .text-sm, .text-base')).filter(isVisible);
+                    if (pTags.length > 0) {
+                        header = pTags.map(p => p.textContent.trim()).filter(Boolean).join('\\n');
+                    }
+                }
+                if (!header) return null;
+            }
+            
+            return { header, options, hasWriteIn };
+        },
+
+        isClassicIDE: () => true,
+
+        getVisibleChatContainer: () => {
+            const input = AG_UI.getChatInput();
+            if (input) {
+                let el = input;
+                while (el) {
+                    if (el.id === 'conversation' || 
+                        el.classList.contains('interactive-session') || 
+                        el.classList.contains('chat-container') ||
+                        el.id === 'chat') {
+                        return el;
+                    }
+                    el = el.parentElement;
+                }
+            }
+
+            const candidates = [
+                '#conversation', 
+                '.interactive-session',
+                '.chat-container',
+                '#chat'
+            ];
+            
+            const containers = Array.from(document.querySelectorAll(candidates.join(', ')));
+            return containers.find(c => {
+                let isVisible = true;
+                let el = c;
+                while (el) {
+                    if (window.getComputedStyle(el).display === 'none') {
+                        isVisible = false;
+                        break;
+                    }
+                    el = el.parentElement;
+                }
+                return isVisible;
+            }) || containers[0] || null;
+        },
+
+        getChatInput: () => {
+            const candidates = [
+                '.interactive-input-editor textarea',
+                '#conversation textarea',
+                '#chat textarea',
+                '.chat-input textarea',
+                '.chat-input [contenteditable="true"]',
+                '[aria-label*="chat input" i] textarea',
+                '[aria-label*="chat input" i] [contenteditable="true"]',
+                '[aria-label*="message input" i]',
+                '[aria-label*="message input" i] [contenteditable="true"]',
+                '[placeholder*="Ask" i] textarea',
+                '[placeholder*="Ask" i] [contenteditable="true"]',
+                '[placeholder*="Sohbet" i] textarea',
+                '[placeholder*="Sohbet" i] [contenteditable="true"]'
+            ];
+
+            const editors = [...document.querySelectorAll(candidates.join(', '))]
+                .filter(el => {
+                    if (el.className && typeof el.className === 'string' && el.className.includes('xterm')) return false;
+                    return AG_UI.isVisible(el);
+                });
+
+            return editors.at(-1) || null;
+        },
+
+        getStopButton: () => {
+            const chatArea = AG_UI.getVisibleChatContainer() || document;
+            
+            const stopIcons = Array.from(chatArea.querySelectorAll(
+                "svg.lucide-square, [data-tooltip-id*='cancel'], [aria-label*='Stop'], [title*='Stop'], [aria-label*='Cancel'], [aria-label*='Durdur'], [title*='Durdur']"
+            ));
+            
+            for (const icon of stopIcons) {
+                if (icon.closest('.modal, [role="dialog"], [data-testid*="interactive-modal"]')) continue;
+                return icon.closest('button') || icon;
+            }
+            
+            const allBtns = Array.from(chatArea.querySelectorAll('button'));
+            return allBtns.find(b => {
+                if (b.closest('.modal, [role="dialog"], [data-testid*="interactive-modal"]')) return false;
+                if (b.querySelector('svg.lucide-square')) return true;
+                const t = (b.textContent || '').trim().toLowerCase();
+                return t === 'stop' || t === 'cancel' || t === 'durdur' || t === 'iptal';
+            }) || null;
+        },
+
+        isLoading: () => {
+            const selectors = [
+                '.codicon-loading', 
+                '.loading', 
+                '[class*="animate-spin"]', 
+                '[class*="spinner"]', 
+                '[class*="loader"]',
+                '.thinking-indicator'
+            ];
+            
+            return Array.from(document.querySelectorAll(selectors.join(', '))).some(el => {
+                if (!AG_UI.isVisible(el)) return false;
+                if (el.className && typeof el.className === 'string') {
+                    if (el.className.includes('h-3') && el.className.includes('w-3')) return false;
+                }
+                const parent = el.parentElement;
+                if (parent && parent.className && typeof parent.className === 'string') {
+                    if (parent.className.includes('opacity-') || parent.className.includes('hidden')) return false;
+                }
+                return true;
+            });
+        },
+
+        getNewChatButton: () => {
+            const svgPath = document.querySelector('path[d="M12 4.5v15m7.5-7.5h-15"]');
+            if (svgPath) {
+                const btn = svgPath.closest('button, a, [role="button"]');
+                if (btn) return btn;
+            }
+            
+            const iconSelectors = 'svg.lucide-plus, svg.lucide-square-pen, svg.lucide-message-square-plus';
+            const icon = document.querySelector(iconSelectors);
+            if (icon) {
+                const btn = icon.closest('button, a, [role="button"]');
+                if (btn) return btn;
+            }
+            
+            const selectors = [
+                '[aria-label*="New Chat" i]',
+                '[title*="New Chat" i]',
+                '[aria-label*="Yeni Sohbet" i]',
+                '[title*="Yeni Sohbet" i]',
+                '[aria-label*="New Conversation" i]',
+                '[title*="New Conversation" i]',
+                '[class*="new-chat"]',
+                '[aria-label*="New Task" i]',
+                '[title*="New Task" i]',
+                '[data-tooltip-id*="new-conversation" i]'
+            ];
+            let btn = document.querySelector(selectors.join(', '));
+            if (btn) return btn;
+            
+            const allBtns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            return allBtns.find(b => {
+                const text = (b.textContent || '').trim().toLowerCase();
+                return text === 'new chat' || text === 'new conversation' || text === 'yeni sohbet';
+            }) || null;
+        },
+
+        getModelSelectorButton: () => {
+            const isFile = (str) => /\.(js|jsx|ts|tsx|md|json|py|html|css|txt|sh)$/i.test((str || '').trim());
+
+            const explicit = Array.from(document.querySelectorAll(
+                '[data-testid="model-selector-trigger"], [data-testid*="model-selector" i], [aria-label*="Select model" i], [title*="Select model" i], [aria-label*="选择模型" i], [title*="选择模型" i], [aria-label*="current:" i], [aria-label*="当前" i], [data-testid*="model-select" i]'
+            )).filter(AG_UI.isVisible);
+
+            const validExplicit = explicit.filter(el => {
+                if (el.closest('.monaco-tree-view, .explorer-viewlet, .tabs-container, .monaco-editor, .monaco-list, .monaco-list-rows')) return false;
+                const text = (el.textContent || '').trim();
+                const label = (el.getAttribute('aria-label') || '').trim();
+                if (isFile(text) || isFile(label)) return false;
+                return true;
+            });
+
+            if (validExplicit.length > 0) return validExplicit[0];
+
+            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash', 'llama', 'mistral', 'deepseek'];
+            const allButtons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(el => {
+                if (!AG_UI.isVisible(el)) return false;
+                if (el.closest('.monaco-tree-view, .explorer-viewlet, .tabs-container, .monaco-editor, .monaco-list, .monaco-list-rows')) return false;
+                const inMenu = el.closest('[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], div[class*="popover"], div[class*="dropdown-content"]');
+                if (inMenu) return false;
+                
+                const text = (el.textContent || '').trim();
+                const label = (el.getAttribute('aria-label') || '').trim();
+                if (isFile(text) || isFile(label)) return false;
+                return true;
+            });
+
+            return allButtons.find(el => {
+                const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.textContent || '')).toLowerCase();
+                return label.includes('选择模型') ||
+                    label.includes('select model') ||
+                    label.includes('current:') ||
+                    modelKeywords.some(k => label.includes(k));
+            }) || null;
+        },
+
+        getModelOptions: () => {
+            const isFile = (str) => /\.(js|jsx|ts|tsx|md|json|py|html|css|txt|sh)$/i.test((str || '').trim());
+            const modelKeywords = ['gemini', 'claude', 'gpt', 'opus', 'sonnet', 'flash', 'llama', 'mistral', 'deepseek'];
+            
+            const selectorBtn = AG_UI.getModelSelectorButton();
+            const ariaControlsId = selectorBtn ? selectorBtn.getAttribute('aria-controls') : null;
+            const controlledContainer = ariaControlsId ? document.getElementById(ariaControlsId) : null;
+
+            const menuContainers = Array.from(document.querySelectorAll(
+                '[data-testid="model-selector-panel"], [role="menu"], [role="listbox"], [role="dialog"], [data-radix-popper-content-wrapper], div[class*="popover"], div[class*="dropdown-content"], div[class*="select-content"], div[class*="menu"], div[class*="animate-slideIn"]'
+            )).filter(AG_UI.isVisible);
+
+            if (controlledContainer && AG_UI.isVisible(controlledContainer) && !menuContainers.includes(controlledContainer)) {
+                menuContainers.push(controlledContainer);
+            }
+
+            let candidates = [];
+            if (menuContainers.length > 0) {
+                menuContainers.forEach(container => {
+                    const items = Array.from(container.querySelectorAll(
+                        '[data-testid="model-selector-item"], [data-model-base], button, [role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], .model-option, .main-row-trigger, [data-radix-collection-item], [data-radix-select-item]'
+                    ));
+                    candidates.push(...items);
+                });
+            } else {
+                candidates = Array.from(document.querySelectorAll(
+                    '[data-testid="model-selector-item"], [data-model-base], [role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], .model-option, .main-row-trigger, [data-radix-collection-item], [data-radix-select-item]'
+                ));
+            }
+
+            return candidates.filter(el => {
+                if (!AG_UI.isVisible(el)) return false;
+                if (el.closest('.monaco-tree-view, .explorer-viewlet, .tabs-container, .monaco-editor, .monaco-list, .monaco-list-rows')) return false;
+                const text = (el.textContent || '').trim();
+                const label = (el.getAttribute('aria-label') || '').trim();
+                const baseAttr = el.querySelector('[data-model-base]')?.getAttribute('data-model-base') || el.getAttribute('data-model-base') || '';
+                const labelAttr = el.getAttribute('data-model-label') || '';
+                
+                if (isFile(text) || isFile(label)) return false;
+                
+                if (text.length < 3 || text.length > 100) return false;
+                
+                const lower = (text + ' ' + label + ' ' + baseAttr + ' ' + labelAttr).toLowerCase();
+                return modelKeywords.some(k => lower.includes(k));
+            });
+        },
+
+        getWorkspaceCards: () => {
+            return []; // IDE does not have in-app workspace cards like standalone
+        },
+
+        getChatThreadPills: (container = document) => {
+            return Array.from(container.querySelectorAll('[data-testid^="convo-pill-"], .convo-pill, [class*="conversation-pill"]'));
+        },
+        
+        isVisible: (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            return !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length > 0));
+        },
+
+        removeThoughtBlocks: (clone) => {
+            const thoughtSelectors = [
+                'button[data-testid*="worked-for"]',
+                '[data-testid="worked-for-collapsible"]',
+                'button[class*="worked-for"]',
+                '.thought-block',
+                '[class*="thought-"]',
+                'details.thought',
+                'thought',
+                '[class*="group/run-command"]',
+                '[class*="group/tool-"]',
+                '[class*="group/file-change"]',
+                '[class*="group/edit-file"]'
+            ];
+            Array.from(clone.querySelectorAll(thoughtSelectors.join(', '))).forEach(el => {
+                const next = el.nextElementSibling;
+                if (next && (next.classList.contains('relative') || next.querySelector('.overflow-y-auto'))) {
+                    next.remove();
+                }
+                el.remove();
+            });
+            Array.from(clone.querySelectorAll('button')).forEach(b => {
+                const txt = (b.innerText || b.textContent || '').trim();
+                if (/^(Thought|Worked|Ran|Explored|Planning|Thinking|Working|Running)\\b/i.test(txt)) {
+                    const next = b.nextElementSibling;
+                    if (next && (next.classList.contains('relative') || next.querySelector('.overflow-y-auto'))) {
+                        next.remove();
+                    }
+                    b.remove();
+                }
+            });
+        }
+    };
+`;
+
+module.exports = { IDE_LOCATORS_SCRIPT };

@@ -1,0 +1,3572 @@
+const OriginalCDP = require('chrome-remote-interface');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { t } = require('./i18n');
+
+function escHtml(s) {
+    if (!s) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+// ===== MULTI-WINDOW SUPPORT =====
+let preferredTargetId = null;
+let windowCache = [];
+
+// Track the last successfully resolved conversation UUID.
+// Set by snapshotChatState after a message is sent, used by getFullLatestResponse
+// so /latest doesn't have to guess which thread to read from.
+let lastResolvedThreadId = null;
+function getLastResolvedThreadId() { return lastResolvedThreadId; }
+function setLastResolvedThreadId(id) { lastResolvedThreadId = id; }
+
+// Hook for external subscribers (e.g., TaskWatcher) to be notified when thread ID changes
+let _onThreadResolved = null;
+function setOnThreadResolved(cb) { _onThreadResolved = cb; }
+function _notifyThreadResolved(threadId) {
+    if (_onThreadResolved && threadId) _onThreadResolved(threadId);
+}
+
+/**
+ * Shared target resolver — fetches CDP targets, filters, and sorts.
+ * If a preferred window is set, that window is prioritised.
+ * @param {number} port - CDP debugging port
+ * @param {boolean} includeIframe - whether to include iframe/webview types
+ * @returns {Promise<Array>} sorted array of CDP target objects
+ */
+const DriverFactory = require('./drivers');
+const SUBMIT_ACTION_TEXTS = [
+    'submit', 'send', 'send message', 'gönder',
+    '提交', '发送', '发送消息'
+];
+const PENDING_ACTION_TEXTS = [
+    'run', 'accept', 'allow', 'continue', 'retry',
+    'çalıştır', 'kabul et', 'izin ver', 'devam et', 'yeniden dene',
+    '运行', '接受', '允许', '继续', '重试'
+];
+
+function isLikelyClassicIDETarget(target = {}) {
+    const text = `${target.title || ''} ${target.url || ''}`.toLowerCase();
+    return (
+        text.includes('antigravity ide') ||
+        text.includes('classic ide') ||
+        text.includes('vscode-webview') ||
+        text.includes('vscode-') ||
+        text.includes('monaco')
+    );
+}
+
+function parseSelectableSlashCommand(prompt) {
+    const trimmed = String(prompt || '').trim();
+    if (!trimmed.startsWith('/')) return null;
+
+    let rest = trimmed;
+    const commands = [];
+
+    while (rest.startsWith('/')) {
+        const tokenMatch = rest.match(/^\/([a-zA-Z0-9_-]+)/);
+        if (!tokenMatch) break;
+        const raw = tokenMatch[1];
+        const normalized = raw.toLowerCase().replace(/_/g, '-');
+        commands.push({ command: normalized, rawCommand: normalized });
+        rest = rest.substring(tokenMatch[0].length).trimStart();
+    }
+
+    if (commands.length === 0) return null;
+    const args = rest.trim();
+
+    return {
+        commands,
+        command: commands[0].command,
+        rawCommand: commands[0].rawCommand,
+        args
+    };
+}
+
+function getSelectableSlashCommandForTarget(prompt, target = {}) {
+    const preferredApp = DriverFactory.getDriver().appType;
+    if (preferredApp === 'ide' || isLikelyClassicIDETarget(target)) return null;
+    return parseSelectableSlashCommand(prompt);
+}
+
+// Cache for the active workspace name, refreshed on each resolveTargets call
+let activeWorkspaceName = null;
+const threadNameToIdCache = new Map();
+
+/**
+ * Resolves a conversation UUID by its thread name.
+ * Checks cache first, then scans file system overview.txt headers.
+ */
+function findConversationIdByTitle(threadName) {
+    if (!threadName) return null;
+
+    const isStandalone = DriverFactory.getDriver().appType === 'standalone';
+
+    if (isStandalone && threadNameToIdCache.has(threadName)) {
+        return threadNameToIdCache.get(threadName);
+    }
+
+    try {
+        const appDataName = DriverFactory.getDriver().appDataName;
+        const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
+        if (!fs.existsSync(brainPath)) return null;
+
+        const dirs = fs.readdirSync(brainPath, { withFileTypes: true });
+        
+        // Sort by mtime to search recent threads first — check BOTH overview.txt AND transcript.jsonl
+        const sortedDirs = dirs
+            .filter(d => d.isDirectory())
+            .map(d => {
+                const overviewPath = path.join(brainPath, d.name, '.system_generated', 'logs', 'overview.txt');
+                const transcriptPath = path.join(brainPath, d.name, '.system_generated', 'logs', 'transcript.jsonl');
+                let mtime = 0;
+                let logPath = null;
+                try { if (fs.existsSync(transcriptPath)) { mtime = fs.statSync(transcriptPath).mtimeMs; logPath = transcriptPath; } } catch (_) {}
+                if (!logPath) { try { if (fs.existsSync(overviewPath)) { mtime = fs.statSync(overviewPath).mtimeMs; logPath = overviewPath; } } catch (_) {} }
+                return { name: d.name, logPath, mtime };
+            })
+            .sort((a, b) => b.mtime - a.mtime);
+
+        const unescapeHtml = (str) => {
+            return (str || '')
+                .replace(/&amp;/g, '&')
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/&#x27;/g, "'");
+        };
+        const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ').trim();
+        const searchName = normalize(unescapeHtml(threadName));
+
+        // For short search names, require stricter match
+        const minMatchLen = Math.min(15, searchName.length);
+
+        for (const dir of sortedDirs) {
+            if (!dir.logPath) continue;
+            
+            try {
+                // Read first chunk of file (enough to get conversation title and first user message)
+                const fd = fs.openSync(dir.logPath, 'r');
+                const buffer = Buffer.alloc(6000);
+                const bytesRead = fs.readSync(fd, buffer, 0, 6000, 0);
+                fs.closeSync(fd);
+                
+                const content = buffer.toString('utf8', 0, bytesRead);
+                const lines = content.split('\n');
+                
+                for (const line of lines) {
+                    if (!line.includes('"source":"USER_EXPLICIT"')) continue;
+                    try {
+                        const entry = JSON.parse(line);
+                        const match = entry.content.match(/<USER_REQUEST>\n?([\s\S]*?)\n?<\/USER_REQUEST>/);
+                        if (match) {
+                            let firstMsg = normalize(match[1]);
+                            if (firstMsg.length > 80) firstMsg = firstMsg.substring(0, 80);
+                            
+                            // Check if thread title matches first user message
+                            // IDE generates titles from the first message, so they overlap
+                            const words1 = searchName.split(/\s+/).filter(w => w.length > 2);
+                            const words2 = firstMsg.split(/\s+/).filter(w => w.length > 2);
+                            const intersect = words1.filter(w => words2.includes(w));
+                            const overlapRatio = (words1.length > 0 && words2.length > 0) ? (intersect.length / Math.min(words1.length, words2.length)) : 0;
+                            
+                            let isMatch = false;
+                            
+                            if (isStandalone) {
+                                const hasLongCommonSub = () => {
+                                    for (let len = 12; len >= 8; len--) {
+                                        for (let i = 0; i <= searchName.length - len; i++) {
+                                            const sub = searchName.substring(i, i + len);
+                                            if (firstMsg.includes(sub)) return true;
+                                        }
+                                    }
+                                    return false;
+                                };
+                                
+                                isMatch = firstMsg.includes(searchName.substring(0, minMatchLen)) || 
+                                          searchName.includes(firstMsg.substring(0, minMatchLen)) ||
+                                          (words1.length >= 2 && words2.length >= 2 && overlapRatio >= 0.5) ||
+                                          hasLongCommonSub();
+                            } else {
+                                isMatch = firstMsg.includes(searchName.substring(0, minMatchLen)) || 
+                                          searchName.includes(firstMsg.substring(0, minMatchLen)) ||
+                                          (words1.length >= 2 && words2.length >= 2 && overlapRatio >= 0.5);
+                            }
+
+                            if (isMatch) {
+                                if (isStandalone) {
+                                    threadNameToIdCache.set(threadName, dir.name);
+                                    if (threadNameToIdCache.size > 500) { threadNameToIdCache.delete(threadNameToIdCache.keys().next().value); }
+                                }
+                                return dir.name;
+                            }
+                        }
+                    } catch (e) {}
+                    break; // Only check the first USER_EXPLICIT
+                }
+            } catch (e) {}
+        }
+    } catch (e) {
+        console.debug('[findConversationIdByTitle] Error:', e.message);
+    }
+    
+    return null;
+}
+
+async function resolveTargets(port, includeIframe = true) {
+    const raw = await httpGet(`http://127.0.0.1:${port}/json`);
+    const targets = JSON.parse(raw);
+    const typeFilter = includeIframe
+        ? t => (t.type === 'page' || t.type === 'iframe' || t.type === 'webview')
+        : t => (t.type === 'page' || t.type === 'webview');
+    const candidates = targets.filter(t => typeFilter(t) &&
+        t.webSocketDebuggerUrl &&
+        !t.url.includes('devtools://') &&
+        !(t.title && t.title.includes('Launchpad')) &&
+        t.title !== 'Manager');
+
+    const preferredApp = DriverFactory.getDriver().appType;
+
+    candidates.sort((a, b) => {
+        // Preferred target by ID always wins (set via /window command)
+        if (preferredTargetId) {
+            if (a.id === preferredTargetId) return -1;
+            if (b.id === preferredTargetId) return 1;
+        }
+
+        // Prioritize based on preferred app ('agent' vs 'ide')
+        const aIsAgent = a.url && (a.url.includes('/c/') || a.url.includes('tab=') || (a.url.includes('127.0.0.1') && !a.url.includes('vscode-')));
+        const bIsAgent = b.url && (b.url.includes('/c/') || b.url.includes('tab=') || (b.url.includes('127.0.0.1') && !b.url.includes('vscode-')));
+
+        if (preferredApp === 'agent') {
+            if (aIsAgent && !bIsAgent) return -1;
+            if (!aIsAgent && bIsAgent) return 1;
+        } else if (preferredApp === 'ide') {
+            if (!aIsAgent && bIsAgent) return -1;
+            if (aIsAgent && !bIsAgent) return 1;
+        }
+
+        // Dynamic fallback: prefer the target matching the active workspace
+        if (activeWorkspaceName) {
+            const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+            const searchName = normalize(activeWorkspaceName);
+            const aMatch = normalize(a.title).includes(searchName) ? 1 : 0;
+            const bMatch = normalize(b.title).includes(searchName) ? 1 : 0;
+            if (aMatch !== bMatch) return bMatch - aMatch;
+        }
+        return 0;
+    });
+
+    return candidates;
+}
+
+
+
+/**
+ * List all available IDE windows for the /window command.
+ */
+async function listWindows(port) {
+    const targets = await resolveTargets(port, false);
+    windowCache = targets.map(t => ({
+        id: t.id,
+        title: t.title || 'Untitled',
+        url: t.url,
+        isPreferred: preferredTargetId ? t.id === preferredTargetId : false
+    }));
+    return windowCache;
+}
+
+function setPreferredWindow(id) {
+    preferredTargetId = id;
+}
+
+function getPreferredWindow() {
+    if (!preferredTargetId) return null;
+    const match = windowCache.find(w => w.id === preferredTargetId);
+    return match ? match.title : preferredTargetId;
+}
+
+function getPreferredTargetId() {
+    return preferredTargetId;
+}
+
+function getCachedWindows() {
+    return windowCache;
+}
+
+
+function getChatExtractExpr() {
+    return `(() => {
+        ${DriverFactory.getDriver().getLocatorsScript()}
+        return (function() {
+            let extractedText = "";
+            try {
+                // Use the centralized locator to find the active conversation
+                const container = AG_UI.getVisibleChatContainer();
+                
+                function cleanText(text) {
+                    if (!text) return "";
+                    text = text.replace(/Ask anything.*?for workflows/gi, '');
+                    text = text.replace(/Ask anything, @ to mention, \\/ for actions/gi, '');
+                    text = text.replace(/0 Files With Changes/g, '');
+                    text = text.replace(/Review Changes/g, '');
+                    text = text.replace(/\\bReview\\b/g, '');
+                    text = text.replace(/\\d+\\s+file[s]?\\s+changed[\\s\\+\\-\\d]*>?/gi, '');
+                    text = text.replace(/Gemini[\\s\\d\\.]+Pro[\\s]*\\([^)]*\\)/gi, '');
+                    text = text.replace(/Claude[\\s\\w\\.]+\\([^)]*\\)/gi, '');
+                    text = text.replace(/GPT[\\s\\w\\.]+\\([^)]*\\)/gi, '');
+                    text = text.replace(/\\bSend\\b\\s*\\b(mic)?\\b/gi, '');
+                    text = text.replace(/\\bmic\\b/gi, '');
+                    text = text.replace(/Worked for \\d+s/gi, '');
+                    text = text.replace(/Thought for \\d+s/gi, '');
+                    text = text.replace(/Ran command[^\\n]*/gi, '');
+                    text = text.replace(/Ran \\d+ tools?[^\\n]*/gi, '');
+                    text = text.replace(/Running \\d+ commands?[^\\n]*/gi, '');
+                    text = text.replace(/Explored \\d+ files?[^\\n]*/gi, '');
+                    text = text.replace(/<thought>[\\s\\S]*?<\\/thought>/gi, '');
+                    text = text.replace(/Thinking\\.{0,3}/gi, "").replace(/Working\\.{0,3}/gi, "").replace(/Gelişim App Dev/g, "");
+
+                    // Strip out file upload system prompts injected by telegram-suite
+                    text = text.replace(/\\[System: The user has uploaded[\\s\\S]*?Use the tool!\\]/g, '');
+                    text = text.replace(/User's message:\\s*/gi, '');
+
+                    text = text.replace(/^\\s*(Plan|Execute|Review|Task|Walkthrough|Implementation Plan)\\s*$/gm, '');
+                    text = text.replace(/undo/g, '');
+                    text = text.replace(/chevron_right/g, '');
+                    text = text.replace(/chevron_left/g, '');
+                    text = text.replace(/content_copy/g, '');
+                    text = text.replace(/thumb_up/g, '');
+                    text = text.replace(/thumb_down/g, '');
+                    text = text.replace(/Files Modified[\\s\\n]*(\\d+)[\\s\\n]*([a-zA-Z0-9_\\-\\.]+)[\\s\\n]*\\+([0-9]+)[\\s\\n]*\\-([0-9]+)/gi, "\\n[📦 Files Modified: $2 (+$3, -$4)]\\n");
+                    text = text.replace(/\\n{3,}/g, '\\n\\n');
+                    return text.trim();
+                }
+
+                function nodeToMd(node) {
+                    if (node.nodeType === 3) return node.textContent;
+                    if (node.nodeType !== 1) return '';
+                    
+                    let tag = node.tagName.toLowerCase();
+                    if (tag === 'style' || tag === 'script') return '';
+                    if (tag === 'img') {
+                        const src = node.currentSrc || node.src || node.getAttribute('src') || '';
+                        if (!src) return '';
+                        const alt = (node.getAttribute('alt') || node.getAttribute('title') || 'image').replace(/[\\]\\r\\n]/g, ' ').trim() || 'image';
+                        return '\\n![' + alt + '](' + src + ')\\n';
+                    }
+                    if (tag === 'pre' || (node.classList && (node.classList.contains('code-block') || node.classList.contains('code-line')))) {
+                        const codeLines = Array.from(node.querySelectorAll('.code-line'));
+                        let lang = '';
+                        const headerEl = node.querySelector('.font-sans, [class*="border-b"], [class*="language-"]');
+                        if (headerEl) {
+                            lang = (headerEl.textContent || '').trim().toLowerCase();
+                            if (lang === 'markdown' || lang === 'text' || lang === 'plaintext') lang = '';
+                        }
+                        if (codeLines.length > 0) {
+                            const code = codeLines.map(l => {
+                                const content = l.querySelector('.line-content') || l;
+                                return content.textContent.replace(/\\u00a0/g, ' ');
+                            }).join('\\n');
+                            return '\\n\`\`\`' + lang + '\\n' + code + '\\n\`\`\`\\n';
+                        }
+                        let codeNode = node.querySelector('code');
+                        if (codeNode) {
+                            let match = codeNode.className.match(/language-([a-z0-9]+)/i);
+                            if (match) lang = match[1];
+                            return '\\n\`\`\`' + lang + '\\n' + (codeNode.innerText || codeNode.textContent) + '\\n\`\`\`\\n';
+                        }
+                        let clone = node.cloneNode(true);
+                        Array.from(clone.querySelectorAll('.min-h-7, [class*="border-b"], button, svg')).forEach(el => el.remove());
+                        return '\\n\`\`\`' + lang + '\\n' + (clone.innerText || clone.textContent).trim() + '\\n\`\`\`\\n';
+                    }
+                    if (tag === 'code') {
+                        return '\`' + node.textContent.trim() + '\`';
+                    }
+                    if (tag === 'table') {
+                        let md = '\\n\`\`\`text\\n';
+                        let rows = Array.from(node.querySelectorAll('tr'));
+                        rows.forEach((row, i) => {
+                            let cells = Array.from(row.querySelectorAll('td, th')).map(c => c.textContent.trim().replace(/\\|/g, '\\\\|'));
+                            md += '| ' + cells.join(' | ') + ' |\\n';
+                            if (i === 0 && row.querySelector('th')) {
+                                md += '|' + cells.map(() => '---').join('|') + '|\\n';
+                            }
+                        });
+                        return md + '\`\`\`\\n';
+                    }
+                    
+                    let md = '';
+                    for (let child of node.childNodes) {
+                        md += nodeToMd(child);
+                    }
+                    
+                    if (tag === 'strong' || tag === 'b') return '**' + md.trim() + '** ';
+                    if (tag === 'em' || tag === 'i') return '_' + md.trim() + '_ ';
+                    if (tag === 'a') return '[' + md.trim() + '](' + node.href + ')';
+                    if (tag === 'p' || tag === 'div') return md + '\\n';
+                    if (tag === 'li') return '- ' + md.trim() + '\\n';
+                    if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') return '\\n### ' + md.trim() + '\\n';
+                    if (tag === 'span') return md;
+                    
+                    const inlineTags = ['a', 'strong', 'b', 'em', 'i', 'code', 'span', '#text'];
+                    if (!inlineTags.includes(tag) && tag !== 'p' && tag !== 'div' && tag !== 'li' && !tag.match(/^h[1-6]$/)) {
+                        return md.trim() + '\\n';
+                    }
+                    
+                    return md;
+                }
+
+                if (container) {
+                    const isClassic = typeof AG_UI !== 'undefined' && AG_UI.isClassicIDE && AG_UI.isClassicIDE();
+                    let messageNodes = [];
+
+                    if (!isClassic) {
+                        messageNodes = Array.from(container.querySelectorAll('.rounded-xl.bg-card-border, .rounded-2xl.bg-card-border'));
+                    }
+
+                    if (messageNodes.length === 0) {
+                        const listSelector = '.relative.flex.flex-col.gap-y-3, .relative.flex.flex-col.gap-y-3.px-4, .monaco-list-rows, [class*="message-list"], .chat-messages, [data-testid*="message-list"]';
+                        const list = container.matches && container.matches(listSelector) ? container : (container.querySelector ? container.querySelector(listSelector) : null);
+                        if (list) messageNodes = Array.from(list.children);
+                    }
+                if (messageNodes.length > 0) {
+                    const msgs = [];
+                    for (let child of messageNodes) {
+                        let clone = child.cloneNode(true);
+                        
+                        Array.from(clone.querySelectorAll('style, .material-icons, .material-symbols-outlined, .material-symbols-rounded, .google-symbols, .codicon, [class*="icon"]')).forEach(el => el.remove());
+                        
+                        // Use centralized logic to remove Thought blocks
+                        AG_UI.removeThoughtBlocks(clone);
+                        
+                        Array.from(clone.querySelectorAll('button, [role="button"]')).forEach(el => {
+                            const t = el.textContent.trim().toLowerCase();
+                            // Remove known action buttons
+                            if (t === 'apply' || t === 'copy' || t === 'run' || t === 'accept' || t === 'reject' || t === 'review changes' || t === 'cancel' || t === 'submit' || t === 'insert' || t === 'terminal' || t.startsWith('apply ')) {
+                                el.remove();
+                            } else {
+                                // Keep context pills/file references, format them as code
+                                const txt = el.textContent.trim();
+                                if (txt) {
+                                    const codeNode = document.createElement('code');
+                                    codeNode.textContent = txt;
+                                    el.parentNode.replaceChild(codeNode, el);
+                                } else {
+                                    el.remove();
+                                }
+                            }
+                        });
+                        
+                        let userNodes = Array.from(clone.querySelectorAll('[role="article"][aria-label="User message"], [aria-label*="User message"], .bg-input, [data-message-author="user"], [class*="group/user-input-step"], .interactive-request, .chat-request'));
+                        if (userNodes.length === 0 && ((clone.getAttribute && (clone.getAttribute('aria-label') === 'User message' || clone.getAttribute('data-message-author') === 'user')) || (clone.className && (clone.className.includes('user-message') || clone.className.includes('interactive-request') || clone.className.includes('chat-request') || clone.className.includes('user-input') || (clone.className.includes('rounded-xl') && clone.className.includes('bg-card-border') && !clone.className.includes('rounded-2xl')))))) {
+                            userNodes = [clone];
+                        }
+                        
+                        if (userNodes.length > 0) {
+                            let isEntireRowUser = false;
+                            userNodes.forEach(un => {
+                                let uText = cleanText(un.innerText || un.textContent);
+                                if (uText) msgs.push("👤 User:\\n" + uText);
+                                if (un === clone) {
+                                    isEntireRowUser = true;
+                                }
+                            });
+                            
+                            if (!isEntireRowUser) {
+                                // First try: look for a dedicated agent response article element
+                                const agentArticle = clone.querySelector('[role="article"][aria-label="Agent response"], [data-message-author="agent"], [data-message-author="assistant"]');
+                                if (agentArticle) {
+                                    // Remove model selectors, thought/tool headers, status spinners
+                                    Array.from(agentArticle.querySelectorAll('style, svg, [data-testid*="worked-for"], [data-testid*="thought"], [data-testid*="model"], [class*="animate-spin"]')).forEach(el => el.remove());
+                                    AG_UI.removeThoughtBlocks(agentArticle);
+
+                                    const markdownEl = agentArticle.querySelector('.leading-relaxed, .prose, .markdown-body, [class*="rendered-markdown"]');
+                                    let aText = '';
+                                    if (markdownEl) {
+                                        aText = cleanText(nodeToMd(markdownEl));
+                                        if (!aText) aText = cleanText(markdownEl.innerText || markdownEl.textContent);
+                                    } else {
+                                        Array.from(agentArticle.querySelectorAll('button, [role="button"]')).forEach(el => el.remove());
+                                        aText = cleanText(nodeToMd(agentArticle));
+                                        if (!aText) aText = cleanText(agentArticle.innerText || agentArticle.textContent);
+                                    }
+                                    if (aText && aText !== '\`\`' && !aText.startsWith('\`Gemini') && !aText.startsWith('\`Claude') && !aText.startsWith('\`GPT')) {
+                                        msgs.push("🤖 Agent:\\n" + aText);
+                                    }
+                                } else {
+                                    // Fallback: remove user nodes and use remaining text
+                                    userNodes.forEach(un => { if (un !== clone) un.remove(); });
+                                    let aText = cleanText(nodeToMd(clone));
+                                    if (aText && aText !== '\`\`') msgs.push("🤖 Agent:\\n" + aText);
+                                }
+                            }
+                        } else {
+                            let aText = cleanText(nodeToMd(clone));
+                            if (aText) msgs.push("🤖 Agent:\\n" + aText);
+                        }
+                    }
+                    // Clean up language names left behind by code block headers
+                    extractedText = msgs.join('\\n\\n').replace(/^(javascript|python|html|css|bash|json|markdown)\\n/gm, '');
+                } else {
+                    // Fallback for Standalone 2.0 or unknown DOM structures
+                    const messageNodes = Array.from(container.querySelectorAll('.prose, .markdown-body, [data-message-author], .chat-message, [class*="message-bubble"]'));
+                    if (messageNodes.length > 0) {
+                        const msgs = [];
+                        messageNodes.forEach(child => {
+                            let clone = child.cloneNode(true);
+                            Array.from(clone.querySelectorAll('style, .material-icons, .material-symbols-outlined, .material-symbols-rounded, .google-symbols, .codicon, [class*="icon"]')).forEach(el => el.remove());
+                            
+                            Array.from(clone.querySelectorAll('button, [role="button"]')).forEach(el => {
+                                const t = el.textContent.trim().toLowerCase();
+                                if (t === 'apply' || t === 'copy' || t === 'run' || t === 'accept' || t === 'reject' || t === 'review changes' || t === 'cancel' || t === 'submit' || t === 'insert' || t === 'terminal' || t.startsWith('apply ')) {
+                                    el.remove();
+                                } else {
+                                    const txt = el.textContent.trim();
+                                    if (txt) {
+                                        const codeNode = document.createElement('code');
+                                        codeNode.textContent = txt;
+                                        el.parentNode.replaceChild(codeNode, el);
+                                    } else {
+                                        el.remove();
+                                    }
+                                }
+                            });
+
+                            let isUser = false;
+                            let curr = child;
+                            while (curr && curr !== container) {
+                                if (curr.getAttribute('data-message-author') === 'user' || (curr.className && (curr.className.includes('user-message') || curr.className.includes('bg-input') || curr.className.includes('user-input')))) {
+                                    isUser = true;
+                                    break;
+                                }
+                                curr = curr.parentElement;
+                            }
+
+                            AG_UI.removeThoughtBlocks(clone);
+                            let text = cleanText(nodeToMd(clone));
+                            if (text) {
+                                let prefixed = (isUser ? "👤 User:\\n" : "🤖 Agent:\\n") + text;
+                                if (!msgs.includes(prefixed)) msgs.push(prefixed);
+                            }
+                        });
+                        extractedText = msgs.join('\\n\\n');
+                    } else {
+                        // Last resort: clone container and strip interactive/layout elements
+                        let clone = container.cloneNode(true);
+                        Array.from(clone.querySelectorAll('style, script, .material-icons, .material-symbols-outlined, .material-symbols-rounded, .google-symbols, .codicon, [class*="icon"]')).forEach(el => el.remove());
+                        Array.from(clone.querySelectorAll('button, input, textarea, nav, header, [role="navigation"], [data-project-card], .convo-pill')).forEach(el => el.remove());
+                        extractedText = cleanText(clone.innerText || clone.textContent || "");
+                    }
+                }
+            }
+        } catch(e) {}
+        return String(extractedText);
+    })();
+})()`;
+}
+
+const CHAT_EXTRACT_EXPR = getChatExtractExpr();
+
+function withTimeout(promise, ms, errorMsg) {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+            reject(new Error(errorMsg || `Operation timed out after ${ms}ms`));
+        }, ms);
+    });
+    return Promise.race([
+        promise,
+        timeoutPromise
+    ]).finally(() => {
+        clearTimeout(timeoutId);
+    });
+}
+
+const CDP = async (options) => {
+    // 1. Connection Timeout
+    const client = await withTimeout(OriginalCDP(options), 5000, "CDP Connect Timeout");
+    
+    // 2. Global CDP Command Timeout
+    // When IDE freezes, ANY CDP command (like Runtime.enable, Runtime.evaluate, etc) can hang indefinitely.
+    // By wrapping client.send, we enforce a global timeout for all operations.
+    if (typeof client.send === 'function') {
+        const originalSend = client.send.bind(client);
+        client.send = async (method, params) => {
+            // Provide larger timeouts for certain operations that might legitimately take longer
+            let timeoutMs = 8000;
+            if (method.includes('captureScreenshot')) timeoutMs = 15000;
+            if (method.includes('Runtime.evaluate') && params?.awaitPromise) timeoutMs = 12000;
+            
+            return await withTimeout(originalSend(method, params), timeoutMs, `CDP ${method} Timeout`);
+        };
+    }
+
+    return client;
+};
+
+function httpGet(url, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+        const req = http.get(url, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => resolve(data));
+        }).on('error', err => reject(err));
+        
+        req.setTimeout(timeoutMs, () => {
+            req.destroy();
+            reject(new Error('HTTP request timed out'));
+        });
+    });
+}
+
+/**
+ * Snapshot the current chat state so subsequent getLatestAgentResponse
+ * calls only return text that appeared AFTER this snapshot.
+ */
+/**
+ * Snapshot the current chat state for diff tracking.
+ * DOM fallback uses globalLastChatState.
+ */
+
+async function snapshotChatState(port, specificTargetId = null, threadName = null) {
+    lastResolvedThreadId = null; // ALWAYS clear stale cache before attempting to anchor
+
+    // STRATEGY 0: Extract exact UUID from active page URL (Standalone App)
+    let candidates = await resolveTargets(port, false);
+    if (specificTargetId && specificTargetId !== 'auto') {
+        const filtered = candidates.filter(t => t.id === specificTargetId);
+        if (filtered.length > 0) candidates = filtered;
+    }
+    for (const target of candidates) {
+        if (target.url) {
+            const uuidMatch = target.url.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+            if (uuidMatch) {
+                const conversationId = uuidMatch[1];
+                console.log(`[snapshot] Anchored via URL extraction → ${conversationId}`);
+                lastResolvedThreadId = conversationId;
+                _notifyThreadResolved(conversationId);
+                if (threadName) threadNameToIdCache.set(threadName, conversationId);
+                return;
+            }
+        }
+    }
+
+    // Strategy 1: If we have a thread name, resolve directly via filesystem
+
+    // This is the most reliable path — used after /agents_N thread switching
+    if (threadName) {
+        const resolvedId = findConversationIdByTitle(threadName);
+        if (resolvedId) {
+            const appDataName = DriverFactory.getDriver().appDataName;
+            const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', resolvedId, '.system_generated', 'logs');
+            const hasLogs = fs.existsSync(path.join(logsDir, 'overview.txt')) || fs.existsSync(path.join(logsDir, 'transcript.jsonl'));
+            if (hasLogs) {
+                lastResolvedThreadId = resolvedId;
+                _notifyThreadResolved(resolvedId);
+                console.log(`[snapshot] Anchored via threadName "${threadName}" → ${resolvedId}`);
+                return;
+            }
+        }
+        console.log(`[snapshot] threadName "${threadName}" could not be resolved via findConversationIdByTitle — trying DOM snippet`);
+    }
+    
+    // Strategy 1.5: Extract chat content from IDE DOM using CHAT_EXTRACT_EXPR (same
+    // approach as _domLatestExtraction), then find a unique snippet in transcripts.
+    if (threadName && specificTargetId) {
+        try {
+            const candidates = await resolveTargets(port, true);
+            const targetCandidates = candidates.filter(c => c.id === specificTargetId);
+            // Also include iframe/webview variants that belong to the same window
+            if (targetCandidates.length === 0) targetCandidates.push(...candidates.slice(0, 2));
+            
+            for (const target of targetCandidates) {
+                try {
+                    const client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 3000, "CDP timeout");
+                    const { Runtime } = client;
+                    await Runtime.enable();
+                    const chatRes = await withTimeout(Runtime.evaluate({
+                        expression: getChatExtractExpr(),
+                        returnByValue: true
+                    }), 5000, "Chat extract timeout");
+                    await client.close();
+                    
+                    const chatText = chatRes.result?.value;
+                    if (!chatText || chatText.trim().length < 30) continue;
+                    
+                    // Extract a unique snippet — use last agent response
+                    const parts = chatText.split('🤖 Agent:');
+                    let snippet = null;
+                    if (parts.length > 1) {
+                        const lastResponse = parts[parts.length - 1].trim();
+                        // Take a 50-char snippet from the end
+                        if (lastResponse.length > 50) {
+                            snippet = lastResponse.substring(lastResponse.length - 50).trim();
+                        } else {
+                            snippet = lastResponse.trim();
+                        }
+                    }
+                    
+                    if (snippet && snippet.length > 15) {
+                        // Search transcripts for this snippet
+                        const appDataName = DriverFactory.getDriver().appDataName;
+                        const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
+                        if (fs.existsSync(brainPath)) {
+                            // Sort directories by mtime descending to check most recently active chats first
+                            const dirs = fs.readdirSync(brainPath, { withFileTypes: true })
+                                .filter(d => d.isDirectory())
+                                .map(d => ({
+                                    name: d.name,
+                                    time: fs.statSync(path.join(brainPath, d.name)).mtime.getTime()
+                                }))
+                                .sort((a, b) => b.time - a.time);
+
+                            for (const dir of dirs) {
+                                const tp = path.join(brainPath, dir.name, '.system_generated', 'logs', 'transcript.jsonl');
+                                if (!fs.existsSync(tp)) continue;
+                                try {
+                                    const stats = fs.statSync(tp);
+                                    const readSize = Math.min(50000, stats.size);
+                                    const fd = fs.openSync(tp, 'r');
+                                    const buffer = Buffer.alloc(readSize);
+                                    fs.readSync(fd, buffer, 0, readSize, Math.max(0, stats.size - readSize));
+                                    fs.closeSync(fd);
+                                    const tail = buffer.toString('utf8');
+                                    if (tail.includes(snippet)) {
+                                        lastResolvedThreadId = dir.name;
+                                        _notifyThreadResolved(dir.name);
+                                        threadNameToIdCache.set(threadName, dir.name);
+                                        if (threadNameToIdCache.size > 500) { threadNameToIdCache.delete(threadNameToIdCache.keys().next().value); }
+                                        console.log(`[snapshot] Anchored via DOM content match → ${dir.name}`);
+                                        return;
+                                    }
+                                } catch (_) {}
+                            }
+                        }
+                        console.log(`[snapshot] DOM content snippet "${snippet.substring(0, 30)}..." did not match any transcript`);
+                    }
+                } catch (e) {
+                    // Try next candidate
+                }
+            }
+        } catch (e) {
+            console.log(`[snapshot] DOM content strategy failed: ${e.message}`);
+        }
+    }
+    
+    // Strategy 2: Use CDP to detect the active thread from IDE DOM
+    try {
+        const activeId = await getActiveThreadId(port, specificTargetId || preferredTargetId);
+        if (!activeId) return;
+        const appDataName = DriverFactory.getDriver().appDataName;
+        const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', activeId, '.system_generated', 'logs');
+        const hasLogs = fs.existsSync(path.join(logsDir, 'overview.txt')) || fs.existsSync(path.join(logsDir, 'transcript.jsonl'));
+        if (!hasLogs) return;
+        
+        // Persist the resolved thread ID so /latest can use it directly
+        // instead of re-guessing which window/thread is active
+        lastResolvedThreadId = activeId;
+        _notifyThreadResolved(activeId);
+        console.log(`[snapshot] Anchored file-based thread: ${activeId}`);
+        return;
+    } catch (e) {
+        console.log('[snapshot] File-based snapshot failed:', e.message);
+    }
+    
+    // Strategy 3: DOM fallback for legacy behavior
+    let candidates2 = await resolveTargets(port);
+    if (specificTargetId) {
+        candidates2 = candidates2.filter(t => t.id === specificTargetId);
+    }
+    for (const target of candidates2) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            const boxResult = await Runtime.evaluate({ expression: getChatExtractExpr(), awaitPromise: true, returnByValue: true });
+            const val = boxResult?.result?.value;
+            await client.close();
+            if (val && val.length > 0) {
+                console.log(`[snapshot] DOM fallback anchored (${val.length} chars)`);
+                return;
+            }
+        } catch (_) {}
+    }
+}
+
+/**
+ * Get the latest agent response since the last snapshot.
+ * 
+ * Primary strategy: Read new entries from the active thread's overview.txt
+ * since the last snapshotted step_index. This avoids stale DOM issues and
+ * timestamp bleed from the DOM extraction.
+ * 
+ * Falls back to DOM extraction if the file doesn't exist.
+ */
+
+/**
+ * Get the full last agent response block (no diffing).
+ * Used by /latest command.
+ * 
+ * Strategy: Read from the file system instead of the DOM, because the IDE's
+ * workspace DOM often retains stale content from previously-viewed threads.
+ * 
+ * 1. Get the active thread ID from the Manager sidebar (reliable)
+ * 2. Read the thread's overview.txt log file from disk
+ * 3. Parse the last user message + model response from the log
+ * 4. Fall back to DOM extraction only if the file doesn't exist
+ */
+/**
+ * Extract latest agent response from the DOM of the currently targeted window.
+ * Used when a preferred window is set (so filesystem thread may differ) and
+ * also called directly on window switch for auto-latest.
+ */
+async function _domLatestExtraction(port, specificTargetId = null) {
+    let candidates = await resolveTargets(port);
+    if (specificTargetId) {
+        const filtered = candidates.filter(t => t.id === specificTargetId); if (filtered.length > 0) candidates = filtered;
+    }
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            
+            // Extract the whole chat history from the DOM
+            const res = await Runtime.evaluate({
+                expression: getChatExtractExpr().replace('} catch(e) {}', '} catch(e) { extractedText = "ERROR_DOM: " + e.message; }'),
+                returnByValue: true
+            });
+            await client.close();
+            
+            if (res.result?.value && res.result.value.trim() !== '') {
+                const fullText = res.result.value.trim();
+                if (fullText.startsWith('ERROR_DOM:')) {
+                    console.debug('[_domLatestExtraction] DOM error:', fullText);
+                    continue; // Try next candidate
+                }
+                
+                // Try to find the last user message and agent response
+                const parts = fullText.split('👤 User:');
+                if (parts.length > 1) {
+                    const lastTurn = parts[parts.length - 1];
+                    const agentParts = lastTurn.split('🤖 Agent:');
+                    if (agentParts.length > 1 && agentParts.slice(1).join('').trim().length > 0) {
+                        const lastAgentText = agentParts.slice(1).join('\n\n').trim();
+                        if (lastAgentText !== '``' && !lastAgentText.startsWith('`Gemini') && !lastAgentText.startsWith('`Claude') && !lastAgentText.startsWith('`GPT')) {
+                            return lastAgentText;
+                        }
+                    }
+                    // There is no agent response in this turn yet (e.g. agent is generating or paused on question)
+                    // Check if there is a previous completed turn to display
+                    for (let p = parts.length - 2; p >= 1; p--) {
+                        const prevTurn = parts[p];
+                        const prevAgentParts = prevTurn.split('🤖 Agent:');
+                        if (prevAgentParts.length > 1 && prevAgentParts.slice(1).join('').trim().length > 0) {
+                            const prevAgentText = prevAgentParts.slice(1).join('\n\n').trim();
+                            if (prevAgentText !== '``' && !prevAgentText.startsWith('`Gemini') && !prevAgentText.startsWith('`Claude') && !prevAgentText.startsWith('`GPT')) {
+                                return prevAgentText;
+                            }
+                        }
+                    }
+                    return "";
+                }
+                
+                // If no User tag found, the fallback might have just returned all text.
+                // We'll return the last 1500 chars to be safe, or just the whole thing
+                // if it's small, because we don't want to return a huge wall of text.
+                if (fullText.length > 3000) {
+                    return fullText.substring(fullText.length - 3000);
+                }
+                return fullText;
+            }
+        } catch(e) {}
+    }
+    return null;
+}
+
+async function getInteractiveModalState(port, specificTargetId = null) {
+    let candidates = await resolveTargets(port);
+    if (specificTargetId) { const filtered = candidates.filter(t => t.id === specificTargetId); if (filtered.length > 0) candidates = filtered; }
+    
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            const res = await Runtime.evaluate({
+                expression: `(() => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        if (el.classList && el.classList.contains('sr-only') && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'BUTTON')) return true;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const s = window.getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0;
+                    };
+
+                    const isExcluded = (el) => !!el.closest('.titlebar, .monaco-workbench .menubar, .monaco-workbench .statusbar, .monaco-workbench .activitybar, .monaco-editor, .editor-widget, .find-widget, .quick-input-widget, .monaco-menu-container, .context-view, .tabs-container, .monaco-action-bar, .actions-container');
+
+                    // 1. Direct interactive question elements (radio buttons, checkboxes, radiogroup, write-in)
+                    const allRadios = Array.from(document.querySelectorAll('[role="radio"], input[type="radio"]')).filter(el => isVisible(el) && !isExcluded(el));
+                    const allCheckboxes = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]')).filter(el => isVisible(el) && !isExcluded(el));
+                    const radiogroups = Array.from(document.querySelectorAll('[role="radiogroup"], textarea[data-testid*="ask-question" i]')).filter(el => isVisible(el) && !isExcluded(el));
+                    const interactiveElements = [...allRadios, ...allCheckboxes, ...radiogroups];
+
+                    let container = null;
+                    if (interactiveElements.length > 0) {
+                        // Walk up to find a container that has all options AND some text (header)
+                        let ancestor = interactiveElements[0].parentElement;
+                        while (ancestor && ancestor !== document.body) {
+                            if (interactiveElements.every(el => ancestor.contains(el))) {
+                                if (ancestor.tagName === 'FORM' || ancestor.tagName === 'FIELDSET' || ancestor.getAttribute('role') === 'dialog' || ancestor.classList.contains('no-focus-ring') || ancestor.classList.contains('modal') || (ancestor.className && ancestor.className.includes('bg-card-border'))) {
+                                    container = ancestor;
+                                    break;
+                                }
+                                const textEls = Array.from(ancestor.querySelectorAll('p, h2, h3, h4, legend'));
+                                if (textEls.some(t => t.textContent.trim().length > 5)) {
+                                    container = ancestor;
+                                    break;
+                                }
+                            }
+                            ancestor = ancestor.parentElement;
+                        }
+                        
+                        // Fallback
+                        if (!container) {
+                            container = interactiveElements[0].closest('form, fieldset, [role="dialog"], .modal, [class*="bg-card-border"], div.p-4, div.p-3, div.p-2, div.border') || interactiveElements[0].parentElement?.parentElement?.parentElement || interactiveElements[0].parentElement;
+                        }
+                    }
+
+                    // 2. Check for standard modal dialog containers
+                    if (!container) {
+                        const allContainers = Array.from(document.querySelectorAll(
+                            '.modal, [role="dialog"], .interactive-session, [data-testid*="interactive-modal"], [data-testid*="question"]'
+                        )).filter(c => isVisible(c) && !isExcluded(c));
+                        container = allContainers[0] || null;
+                    }
+                    
+                    // 3. Check for submit / skip / proceed action buttons
+                    if (!container) {
+                        const allBtns = Array.from(document.querySelectorAll('button, [role="button"], a, div[class*="cursor-pointer"]')).filter(b => isVisible(b) && !isExcluded(b));
+                        const submitBtn = allBtns.find(b => {
+                            const t = (b.textContent || '').trim().toLowerCase();
+                            return t === 'submit' || t === 'skip' || t === 'gönder' || t === 'atla' || t === 'proceed' || t === 'onayla';
+                        });
+                        if (submitBtn) {
+                            container = submitBtn.closest('form, fieldset, [class*="rounded"], div.p-4, div.p-3, div.border') || submitBtn.parentElement?.parentElement;
+                        }
+                    }
+
+                    // 4. Check for write-in textarea
+                    if (!container) {
+                        const otherInput = Array.from(document.querySelectorAll('textarea, input[type="text"]')).find(t => {
+                            if (!isVisible(t) || isExcluded(t) || t.classList.contains('xterm')) return false;
+                            const ph = (t.placeholder || '').toLowerCase();
+                            return ph.includes('other') || ph.includes('answer') || ph.includes('diğer');
+                        });
+                        if (otherInput) {
+                            let ancestor = otherInput.parentElement;
+                            while(ancestor && ancestor !== document.body) {
+                                if (ancestor.querySelectorAll('input[type="radio"], input[type="checkbox"], label').length > 1) {
+                                    container = ancestor;
+                                    break;
+                                }
+                                ancestor = ancestor.parentElement;
+                            }
+                            if (!container) {
+                                container = otherInput.closest('form, fieldset, [class*="rounded"], div.p-4, div') || otherInput.parentElement?.parentElement;
+                            }
+                        }
+                    }
+
+                    if (!container) return null;
+
+                    // Clean clone of container to remove any inline style tags, scripts, svgs, icons
+                    const cleanContainer = container.cloneNode(true);
+                    cleanContainer.querySelectorAll('style, script, svg, [class*="icon"]').forEach(s => s.remove());
+
+                    // Extract Question Header
+                    let headerEl = Array.from(cleanContainer.querySelectorAll('.modal-header, [data-testid*="interactive-modal"] h2, [data-testid*="modal"] h2, h2, h3.font-medium, h3, h4, fieldset legend, .leading-relaxed p, .leading-relaxed, p, .text-sm, .text-base, .font-semibold, .font-medium')).find(el => {
+                        if (el.tagName === 'BUTTON' || el.closest('button') || el.closest('[role="button"]') || el.closest('[role="radiogroup"]')) return false;
+                        return el.textContent.trim().length > 0;
+                    });
+                    let header = (headerEl && headerEl.textContent.trim()) || '';
+
+                    // Extract Options
+                    const optionCandidateEls = Array.from(cleanContainer.querySelectorAll(
+                        'label, [role="radio"], [role="checkbox"], input[type="radio"], input[type="checkbox"], [data-testid*="option"]'
+                    ));
+
+                    let options = [];
+                    for (const el of optionCandidateEls) {
+                        const elClone = el.cloneNode(true);
+                        // Remove write-in textarea, badge numbers (1, 2, etc.), inputs
+                        elClone.querySelectorAll('textarea, input, .rounded.bg-border, span.font-mono').forEach(b => b.remove());
+                        let txt = elClone.textContent.trim();
+                        txt = txt.replace(/^[0-9]+[\\s.)\\-]+/, '').replace(/\\b\\(Recommended\\)\\b/gi, '').trim();
+                        if (txt && !txt.match(/^(Other|Other \\(write your answer\\)|Other \\(write in\\)|Diğer|Submit|Skip|Gönder|Atla|\\d+)$/i)) {
+                            if (!options.includes(txt)) options.push(txt);
+                        }
+                    }
+
+                    options = [...new Set(options)];
+
+                    if (!header && options.length > 0) {
+                        const textNodes = Array.from(cleanContainer.querySelectorAll('p, .text-sm, .text-base, div, legend'));
+                        for (let el of textNodes) {
+                            const txt = el.textContent.trim();
+                            if (txt && (txt.includes('?') || txt.length > 10) && !options.includes(txt) && !options.some(o => o.includes(txt))) {
+                                header = txt;
+                                break;
+                            }
+                        }
+                    }
+
+                    const hasWriteIn = !!cleanContainer.querySelector('textarea, input[type="text"]');
+                    if (options.length === 0 && !hasWriteIn && !cleanContainer.querySelector('[role="dialog"], .modal')) {
+                        return null;
+                    }
+
+                    header = header || 'Agent Soru Sordu / Question';
+
+                    return { header, options };
+                })()`,
+                returnByValue: true
+            });
+            await client.close();
+            
+            if (res.result?.value) {
+                return res.result.value;
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
+async function getFullLatestResponse(port, specificTargetId = null, threadName = null, includeThoughts = false) {
+    const targetIdToUse = specificTargetId || preferredTargetId;
+    
+    let modalText = "";
+    let modalButtons = null;
+    try {
+        const modalState = await getInteractiveModalState(port, targetIdToUse);
+        if (modalState) {
+            modalText = `\n\n❓ <b>${escHtml(modalState.header || 'Agent Soru Sordu')}</b>\n`;
+            if (modalState.options && modalState.options.length > 0) {
+                modalText += `\n${t('interactive_modal.options_prompt')}`;
+                modalButtons = {
+                    reply_markup: {
+                        inline_keyboard: modalState.options.map((opt, i) => ([{ text: `${i + 1}️⃣ ${opt}`, callback_data: `ans_${i + 1}` }]))
+                    }
+                };
+            } else {
+                modalText += `\n${t('interactive_modal.confirm_prompt')}`;
+                modalButtons = {
+                    reply_markup: {
+                        inline_keyboard: [ [{ text: t('interactive_modal.btn_confirm'), callback_data: 'ans_Onayla' }, { text: t('interactive_modal.btn_reject'), callback_data: 'ans_Reddet' }] ]
+                    }
+                };
+            }
+        }
+    } catch(e) {}
+    
+    
+    // === PRIMARY: CDP DOM extraction (reads what's actually on screen) ===
+    // This is the most reliable method for IDE because it reads the REAL active
+    // conversation from the DOM, not a cached/stale threadId from the filesystem.
+    // The filesystem approach was prone to returning responses from wrong conversations
+    // when lastResolvedThreadId pointed to a stale thread.
+    try {
+        const domResult = await _domLatestExtraction(port, targetIdToUse);
+        if ((domResult && domResult.trim().length > 0) || modalText) {
+            const finalDomText = (domResult && domResult.trim().length > 0) ? (domResult + modalText) : modalText.trim();
+            console.log(`[getFullLatestResponse] ✓ DOM extraction successful (${finalDomText.length} chars) | Target: ${targetIdToUse || 'auto'}`);
+            
+            // Side-effect: resolve conversation UUID from the DOM content so that
+            // /artifacts and other filesystem-dependent commands know which thread is active
+            try {
+                const snippet = domResult && domResult.length > 80 ? domResult.substring(20, 70).trim() : (domResult ? domResult.substring(0, 40).trim() : '');
+                if (snippet.length > 15) {
+                    const appDataName = DriverFactory.getDriver().appDataName;
+                    const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
+                    if (fs.existsSync(brainPath)) {
+                        const dirs = fs.readdirSync(brainPath, { withFileTypes: true })
+                            .filter(d => d.isDirectory());
+                        for (const dir of dirs) {
+                            const tp = path.join(brainPath, dir.name, '.system_generated', 'logs', 'transcript.jsonl');
+                            if (!fs.existsSync(tp)) continue;
+                            try {
+                                const stats = fs.statSync(tp);
+                                const readSize = Math.min(50000, stats.size);
+                                const fd = fs.openSync(tp, 'r');
+                                const buffer = Buffer.alloc(readSize);
+                                fs.readSync(fd, buffer, 0, readSize, Math.max(0, stats.size - readSize));
+                                fs.closeSync(fd);
+                                if (buffer.toString('utf8').includes(snippet)) {
+                                    lastResolvedThreadId = dir.name;
+                                    _notifyThreadResolved(dir.name);
+                                    console.log(`[getFullLatestResponse] Resolved thread from DOM content → ${dir.name.substring(0, 8)}`);
+                                    break;
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                }
+            } catch (_) {}
+            
+            return { text: finalDomText, buttons: modalButtons };
+        }
+    } catch (e) {
+        console.log(`[getFullLatestResponse] DOM extraction failed: ${e.message}`);
+    }
+
+    // === FALLBACK: file-system extraction (reads pure markdown) ===
+    // Used when DOM extraction fails or returns empty (e.g. page not loaded yet).
+    // Relies on lastResolvedThreadId or getActiveThreadId to find the conversation.
+    try {
+        let activeId = lastResolvedThreadId;
+        
+        // If no cached thread, try to find one for the active workspace
+        if (!activeId) {
+            activeId = findConversationIdByTitle(threadName) || await getActiveThreadId(port, targetIdToUse);
+        }
+
+        if (activeId) {
+            const appDataName = DriverFactory.getDriver().appDataName;
+            const logsDir = path.join(os.homedir(), '.gemini', appDataName, 'brain', activeId, '.system_generated', 'logs');
+            const transcriptPath = path.join(logsDir, 'transcript.jsonl');
+            const overviewPath = path.join(logsDir, 'overview.txt');
+            
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                const logPath = fs.existsSync(transcriptPath) ? transcriptPath : (fs.existsSync(overviewPath) ? overviewPath : null);
+                const isTranscript = logPath === transcriptPath;
+                
+                if (logPath) {
+                    const content = fs.readFileSync(logPath, 'utf8');
+                    const lines = content.split('\n').filter(l => l.trim());
+                    let modelMsgs = [];
+                    
+                    for (let i = lines.length - 1; i >= 0; i--) {
+                        try {
+                            const entry = JSON.parse(lines[i]);
+                            if (entry.source === 'USER_EXPLICIT' && entry.content) break;
+                            if (entry.source === 'MODEL') {
+                                if (isTranscript && entry.type !== 'PLANNER_RESPONSE') continue;
+                                if (entry.content && entry.content.trim()) {
+                                    let c = entry.content.trim();
+                                    if (!includeThoughts) {
+                                        c = c.replace(/<thought>[\s\S]*?<\/thought>\n?/g, '').trim();
+                                    }
+                                    if (c) modelMsgs.unshift(c);
+                                }
+                            }
+                        } catch (_) {}
+                    }
+                    
+                    if (modelMsgs.length > 0) {
+                        console.log(`[getFullLatestResponse] ✓ Filesystem fallback successful: thread ${activeId.substring(0, 8)} (Attempt ${attempt})`);
+                        return { text: modelMsgs.join('\n\n') + modalText, buttons: modalButtons };
+                    }
+                }
+                
+                if (attempt < 5) {
+                    console.log(`[getFullLatestResponse] Filesystem returned empty messages, waiting 1s for flush... (Attempt ${attempt}/5)`);
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+            }
+        }
+    } catch (e) {
+        console.log('[getFullLatestResponse] Filesystem fallback failed:', e.message);
+    }
+    
+    if (modalText) return { text: modalText.trim(), buttons: modalButtons };
+
+    const isWorking = await isAgentWorking(port, targetIdToUse).catch(() => false);
+    if (isWorking) {
+        return { text: t('ask.working') || '⏳ Ajan şu anda bu talimat üzerinde çalışıyor...', buttons: null };
+    }
+    
+    return { text: t('latest.not_found_active'), buttons: null };
+}
+
+async function captureAgentScreenshot(port) {
+    const candidates = await resolveTargets(port);
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Page, Runtime } = client;
+            await Page.enable();
+            await Runtime.enable();
+
+            const boxResult = await Runtime.evaluate({
+                expression: `
+                    (function() {
+                        const selectors = [
+                            '#conversation', '#chat', '#cascade', 
+                            '.chat-container', '.messages-container', 
+                            '[class*="message-list"]', '[class*="Conversation"]',
+                            '.chat-input', '[contenteditable="true"]'
+                        ];
+                        let targetEl = null;
+                        for (const s of selectors) {
+                            targetEl = document.querySelector(s);
+                            if (targetEl && targetEl.offsetParent !== null) {
+                                if (s === '.chat-input' || s === '[contenteditable="true"]') {
+                                     const container = targetEl.closest('#conversation, #chat, #cascade, [class*="Conversation"], [class*="chat-container"]');
+                                     if (container) targetEl = container;
+                                }
+                                break;
+                            }
+                        }
+                        if (!targetEl) targetEl = document.body;
+                        if (targetEl.offsetHeight < 200) {
+                            const scrollers = Array.from(document.querySelectorAll('div'))
+                                .filter(d => d.offsetHeight > 400 && d.offsetParent !== null)
+                                .sort((a, b) => b.offsetHeight - a.offsetHeight);
+                            if (scrollers.length > 0) targetEl = scrollers[0];
+                        }
+                        const rect = targetEl.getBoundingClientRect();
+                        return { x: rect.x, y: rect.y, width: rect.width || document.documentElement.clientWidth, height: rect.height || document.documentElement.clientHeight };
+                    })()
+                `,
+                awaitPromise: true,
+                returnByValue: true
+            });
+
+            const res = boxResult?.result?.value;
+            if (res) {
+                let screenshotResult = null;
+                try {
+                    screenshotResult = await Page.captureScreenshot({
+                        format: 'jpeg',
+                        quality: 85,
+                        clip: {
+                            x: Math.max(0, res.x || 0),
+                            y: Math.max(0, res.y || 0),
+                            width: Math.min(2500, Math.max(10, res.width || 800)),
+                            height: Math.min(2500, Math.max(10, res.height || 600)),
+                            scale: 1
+                        }
+                    });
+                } catch(e) {
+                    screenshotResult = await Page.captureScreenshot({ format: 'jpeg', quality: 70 });
+                }
+                await client.close();
+                if (screenshotResult && screenshotResult.data) {
+                    return Buffer.from(screenshotResult.data, 'base64');
+                }
+            }
+        } catch(e) {}
+    }
+    throw new Error("Could not capture screenshot on any target");
+}
+
+async function waitForAgentResponse(port, timeoutMs = 450000, onProgress = null, specificTargetId = null) {
+    const startTime = Date.now();
+    let consecutiveIdleCount = 0;
+    let spinnerOnlyCount = 0;
+    let lastProgressTime = 0;
+    let hasStartedGenerating = false;
+    const GRACE_PERIOD_MS = 5000; // Wait at least 5s before accepting idle — gives IDE time to start generating
+
+    while (Date.now() - startTime < timeoutMs) {
+        // Re-fetch targets on each iteration to avoid stale WebSocket connections
+        let candidates;
+        try {
+            const raw = await resolveTargets(port);
+            if (specificTargetId) {
+                candidates = raw.filter(t => t.id === specificTargetId);
+            } else {
+                candidates = raw;
+            }
+        } catch(e) {
+            await new Promise(r => setTimeout(r, 2000));
+            continue;
+        }
+
+        let foundChat = false;
+        let isIdle = false;
+        let isGenerating = false;
+        let lastEvalVal = null;
+
+        for (const target of candidates) {
+            try {
+                const client = await CDP({ target: target.webSocketDebuggerUrl });
+                const { Runtime } = client;
+                await Runtime.enable();
+                const check = await Runtime.evaluate({
+                    expression: `
+                        ${DriverFactory.getDriver().getLocatorsScript()}
+                        (function() {
+                            const isVisible = (el) => {
+                                if (!el) return false;
+                                // sr-only inputs (used by IDE's ask_question widget) are intentionally hidden via CSS clip
+                                // but are still functionally present — treat them as visible
+                                if (el.classList && el.classList.contains('sr-only') && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return true;
+                                const r = el.getBoundingClientRect();
+                                if (r.width === 0 || r.height === 0) return false;
+                                const s = window.getComputedStyle(el);
+                                return s.display !== 'none' && s.visibility !== 'hidden';
+                            };
+                            // Only detect modals INSIDE the chat panel — not in editor toolbars, settings, etc.
+                            const chatPanel = AG_UI.getVisibleChatContainer();
+                            const isInChat = (el) => chatPanel && chatPanel.contains(el);
+                            const radios = Array.from(document.querySelectorAll('[role="radio"], input[type="radio"]')).filter(el => isVisible(el) && isInChat(el));
+                            const checkboxes = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]')).filter(el => isVisible(el) && isInChat(el));
+                            const dialogs = Array.from(document.querySelectorAll('[data-testid*="interactive-modal"], [data-testid*="question"]')).filter(el => isVisible(el));
+                            const textareas = Array.from(document.querySelectorAll('textarea')).filter(t => isVisible(t) && isInChat(t) && !t.classList.contains('xterm'));
+                            const otherTa = textareas.some(t => {
+                                const ph = (t.placeholder || '').toLowerCase();
+                                return ph.includes('other') || ph.includes('answer') || ph.includes('diğer');
+                            });
+                            const isModal = radios.length > 0 || checkboxes.length > 0 || dialogs.length > 0 || otherTa;
+                            
+                            const isGenerating = !!AG_UI.getStopButton();
+                            const editor = AG_UI.getChatInput();
+                            const isInputDisabled = editor ? (editor.getAttribute('contenteditable') === 'false' || editor.disabled) : false;
+                            const isSpinning = AG_UI.isLoading();
+                            
+                            // Check if AutoAccept is active and there is a button waiting to be clicked
+                            // IMPORTANT: Only match buttons INSIDE the chat panel to avoid false positives from editor toolbars
+                            const aaActive = !!window.__AA_BOT_OBSERVER_ACTIVE && !window.__AA_BOT_PAUSED;
+                            let hasPendingButton = false;
+                            if (aaActive && chatPanel) {
+                                const texts = ${JSON.stringify(PENDING_ACTION_TEXTS)};
+                                const btns = Array.from(chatPanel.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+                                hasPendingButton = btns.some(b => {
+                                    const t = (b.textContent||'').trim().toLowerCase();
+                                    return texts.some(x => t === x || t.startsWith(x + ' ') || (t.startsWith(x) && t.length <= x.length + 8));
+                                });
+                            }
+                            
+                            const isIdle = !isGenerating && (!isInputDisabled || isModal) && !isSpinning && !hasPendingButton;
+                            const hasChat = !!AG_UI.getVisibleChatContainer();
+                            return { hasChat, isGenerating, isIdle, isSpinning, hasPendingButton, isModal };
+                        })()
+                    `,
+                    returnByValue: true
+                });
+                const val = check?.result?.value;
+                await client.close();
+
+                if (val && val.hasChat) {
+                    foundChat = true;
+                    lastEvalVal = val; // Store for debug logging
+                    if (val.isGenerating) {
+                        isGenerating = true;
+                        hasStartedGenerating = true;
+                    }
+                    if (val.isIdle && !val.isGenerating) isIdle = true;
+                    break;
+                }
+            } catch(e) { console.debug(`[waitForAgent] target ${target.title}: ${e.message}`); }
+        }
+        
+        // Debug: log state every ~10 seconds
+        const loopElapsed = Date.now() - startTime;
+        if (Math.floor(loopElapsed / 10000) !== Math.floor((loopElapsed - 1500) / 10000)) {
+            const extra = lastEvalVal ? ` spin=${lastEvalVal.isSpinning} pendBtn=${lastEvalVal.hasPendingButton}` : '';
+            console.log(`[waitForAgent] ${Math.round(loopElapsed/1000)}s | foundChat=${foundChat} idle=${isIdle} gen=${isGenerating} hasGen=${hasStartedGenerating} idleCount=${consecutiveIdleCount}${extra} | candidates=${candidates?.length || 0} target=${specificTargetId || 'auto'}`);
+        }
+        
+        if (foundChat) {
+            const elapsed = Date.now() - startTime;
+            if (lastEvalVal && lastEvalVal.isModal) {
+                // Interactive modal (question or confirmation) is waiting for user input
+                consecutiveIdleCount++;
+                if (consecutiveIdleCount >= 2) {
+                    console.log(`[waitForAgent] Interactive modal detected after ${Math.round(elapsed/1000)}s — returning immediately to relay options`);
+                    return true;
+                }
+            } else if (isIdle && !isGenerating) {
+                // If model has started generating and then transitioned to idle, need 3 idle checks (~4.5s)
+                if (hasStartedGenerating) {
+                    consecutiveIdleCount++;
+                    if (consecutiveIdleCount >= 3) return true;
+                } else if (elapsed > GRACE_PERIOD_MS) {
+                    // Never saw generation — be very patient (5 checks ~7.5s after grace)
+                    consecutiveIdleCount++;
+                    if (consecutiveIdleCount >= 5) return true;
+                }
+            } else if (!isGenerating && lastEvalVal && lastEvalVal.isSpinning && !lastEvalVal.hasPendingButton) {
+                // Spinner-only state: agent is not generating but IDE shows a spinner
+                // This happens when agent sets a timer/schedule and is waiting
+                // After enough consecutive checks, consider agent done
+                if (elapsed > GRACE_PERIOD_MS) {
+                    spinnerOnlyCount = (spinnerOnlyCount || 0) + 1;
+                    if (spinnerOnlyCount >= 8) { // ~12 seconds of spinner-only
+                        console.log(`[waitForAgent] Spinner-only idle detected after ${Math.round(elapsed/1000)}s — treating as done`);
+                        return true;
+                    }
+                }
+            } else {
+                consecutiveIdleCount = 0;
+                spinnerOnlyCount = 0;
+            }
+        }
+
+        // Send typing action every 4 seconds to keep Telegram UI active
+        const elapsed = Date.now() - startTime;
+        if (onProgress && elapsed - lastProgressTime >= 4000) {
+            lastProgressTime = elapsed;
+            onProgress('typing');
+        }
+
+        await new Promise(r => setTimeout(r, 1500));
+    }
+    return false;
+}
+
+async function sendViaCDP(text, port, specificTargetId = null) {
+    const candidates = await resolveTargets(port);
+    let sortedCandidates = candidates;
+
+    if (specificTargetId) {
+        sortedCandidates = candidates.filter(t => t.id && t.id.startsWith(specificTargetId));
+    } else if (preferredTargetId) {
+        const pref = candidates.find(t => t.id === preferredTargetId);
+        if (pref && pref.title) {
+            const shortTitle = pref.title.substring(0, 15); // Match base workspace name
+            sortedCandidates = candidates.filter(t => t.id === preferredTargetId || (t.title && t.title.includes(shortTitle)));
+        } else {
+            sortedCandidates = candidates.filter(t => t.id === preferredTargetId);
+        }
+    } else if (activeWorkspaceName) {
+        const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+        const searchName = normalize(activeWorkspaceName);
+        sortedCandidates = candidates.filter(t => normalize(t.title).includes(searchName));
+        if (sortedCandidates.length === 0) sortedCandidates = candidates; // Fallback if none match
+    }
+
+    const errors = [];
+    for (const target of sortedCandidates) {
+        let client;
+        try {
+            client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 3000, "CDP connect timeout");
+            const { Runtime, Input } = client;
+            await Runtime.enable();
+
+            // Auto-stop any running agent generation so new message sends immediately without queueing
+            await Runtime.evaluate({
+                expression: `
+                    (() => {
+                        const stopBtns = Array.from(document.querySelectorAll('button, [role="button"]')).filter(b => {
+                            const rect = b.getBoundingClientRect();
+                            if (rect.width === 0 || rect.height === 0) return false;
+                            const text = (b.textContent || '').trim().toLowerCase();
+                            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const title = (b.getAttribute('title') || '').toLowerCase();
+                            return text === 'stop' || aria.includes('stop') || title.includes('stop') || b.querySelector('.codicon-stop, [class*="stop"]');
+                        });
+                        if (stopBtns.length > 0) {
+                            stopBtns[0].click();
+                            return true;
+                        }
+                        return false;
+                    })()
+                `,
+                returnByValue: true
+            }).catch(() => {});
+            await new Promise(r => setTimeout(r, 250));
+
+            const slashCommand = getSelectableSlashCommandForTarget(text, target);
+            const focusAndClearComposer = async () => {
+                const res = await Runtime.evaluate({
+                    expression: `
+                        ${DriverFactory.getDriver().getLocatorsScript()}
+                        (() => {
+                            const editor = AG_UI.getChatInput();
+                            if (!editor) return false;
+                            editor.focus();
+                            try {
+                                const sel = window.getSelection();
+                                const range = document.createRange();
+                                range.selectNodeContents(editor);
+                                sel.removeAllRanges();
+                                sel.addRange(range);
+                                document.execCommand('delete', false, null);
+                            } catch(e) {}
+                            if (editor.textContent && editor.textContent.length > 0) {
+                                editor.innerHTML = '';
+                            }
+                            editor.dispatchEvent(new Event('input', { bubbles: true }));
+                            return true;
+                        })()
+                    `,
+                    returnByValue: true
+                });
+                return !!res?.result?.value;
+            };
+            const preparedSlashCommand = slashCommand && await focusAndClearComposer().then(async focused => {
+                if (!focused) return { slashPrefixTyped: false, chipInserted: false };
+                await new Promise(r => setTimeout(r, 100));
+
+                for (let i = 0; i < (slashCommand.commands || []).length; i++) {
+                    const cmd = slashCommand.commands[i];
+                    // 1. Send '/' keydown/keyup to open the typeahead menu
+                    await Input.dispatchKeyEvent({ type: 'keyDown', text: '/', key: '/', code: 'Slash', windowsVirtualKeyCode: 191 });
+                    await Input.dispatchKeyEvent({ type: 'keyUp', key: '/', code: 'Slash', windowsVirtualKeyCode: 191 });
+                    await new Promise(r => setTimeout(r, 150));
+                    // 2. Type the command name to filter the dropdown
+                    await Input.insertText({ text: cmd.rawCommand });
+                    await new Promise(r => setTimeout(r, 250));
+                    // 3. Press Enter to select the item and generate the rich chip!
+                    await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                    await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                    await new Promise(r => setTimeout(r, 200));
+                    // 4. Space after chip to allow subsequent chips or text
+                    await Input.insertText({ text: ' ' });
+                    await new Promise(r => setTimeout(r, 100));
+                }
+
+                // 5. Check if decorator chip was actually created in editor
+                const checkRes = await Runtime.evaluate({
+                    expression: `
+                        ${DriverFactory.getDriver().getLocatorsScript()}
+                        (() => {
+                            const editor = AG_UI.getChatInput();
+                            return !!editor?.querySelector('[data-lexical-decorator="true"], [data-uri]');
+                        })()
+                    `,
+                    returnByValue: true
+                });
+                const anyChipInserted = !!checkRes?.result?.value;
+
+                if (anyChipInserted) {
+                    if (slashCommand.args) {
+                        await Input.insertText({ text: slashCommand.args });
+                    }
+                    return { slashPrefixTyped: true, chipInserted: true };
+                } else {
+                    // Non-existent slash command or normal text -> clean reset and fallback to normal text typing!
+                    await focusAndClearComposer();
+                    return { slashPrefixTyped: false, chipInserted: false };
+                }
+            }).catch(() => ({ slashPrefixTyped: false, chipInserted: false }));
+
+            const focusResult = await withTimeout(Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (async function() {
+                        try {
+                            const escapedText = ${JSON.stringify(text)};
+                            const slashCommand = ${JSON.stringify(slashCommand)};
+                            const preparedSlashCommand = ${JSON.stringify(preparedSlashCommand)};
+                            const rectOf = (el) => {
+                                if (!el) return null;
+                                const r = el.getBoundingClientRect();
+                                return {
+                                    x: r.x,
+                                    y: r.y,
+                                    width: r.width,
+                                    height: r.height,
+                                    centerX: r.x + r.width / 2,
+                                    centerY: r.y + r.height / 2
+                                };
+                            };
+                            
+                            // Check if an interactive modal / question card is active
+                            const isVisible = (el) => {
+                                if (!el) return false;
+                                const r = el.getBoundingClientRect();
+                                if (r.width === 0 || r.height === 0) return false;
+                                if (r.bottom < 0 || r.top > window.innerHeight) return false;
+                                const s = window.getComputedStyle(el);
+                                return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0;
+                            };
+                            const isExcluded = (el) => !!el.closest('.titlebar, .monaco-workbench .menubar, .monaco-workbench .statusbar, .monaco-workbench .activitybar, .monaco-editor, .editor-widget, .find-widget, .quick-input-widget, .monaco-menu-container, .context-view, .tabs-container, .monaco-action-bar, .actions-container');
+
+                            // 1. Direct interactive question elements (radio buttons, checkboxes)
+                            const allRadios = Array.from(document.querySelectorAll('[role="radio"], input[type="radio"]')).filter(el => isVisible(el) && !isExcluded(el));
+                            const allCheckboxes = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]')).filter(el => isVisible(el) && !isExcluded(el));
+                            const interactiveElements = [...allRadios, ...allCheckboxes];
+
+                            let modalContainer = null;
+                            if (interactiveElements.length > 0) {
+                                modalContainer = interactiveElements[0].closest('form, fieldset, [role="dialog"], .modal, [class*="rounded"], div.p-4, div.p-3, div.p-2, div.border') ||
+                                                interactiveElements[0].parentElement?.parentElement?.parentElement ||
+                                                interactiveElements[0].parentElement;
+                            }
+
+                            // 2. Check for standard modal dialog containers
+                            if (!modalContainer) {
+                                const allDialogs = Array.from(document.querySelectorAll(
+                                    '.modal, [role="dialog"], .interactive-session, [data-testid*="interactive-modal"], [data-testid*="question"]'
+                                )).filter(c => isVisible(c) && !isExcluded(c));
+                                modalContainer = allDialogs[0] || null;
+                            }
+
+                            // 3. Check for inline question cards with action buttons
+                            if (!modalContainer) {
+                                const allBtns = Array.from(document.querySelectorAll('button')).filter(b => isVisible(b) && !isExcluded(b));
+                                const submitBtn = allBtns.find(b => {
+                                    const t = (b.textContent || '').trim().toLowerCase();
+                                    return t.includes('submit') || t.includes('gönder') || t.includes('skip') || t.includes('atla') || t.includes('proceed') || t.includes('onayla');
+                                });
+                                if (submitBtn) {
+                                    modalContainer = submitBtn.closest('form, fieldset, [class*="rounded"], div.p-4, div.p-3, div.border') || submitBtn.parentElement?.parentElement;
+                                }
+                            }
+
+                            // 4. Check for write-in textarea
+                            if (!modalContainer) {
+                                const otherInput = Array.from(document.querySelectorAll('textarea, input[type="text"]')).find(t => {
+                                    if (!isVisible(t) || isExcluded(t) || t.classList.contains('xterm')) return false;
+                                    const ph = (t.placeholder || '').toLowerCase();
+                                    return ph.includes('other') || ph.includes('answer') || ph.includes('diğer');
+                                });
+                                if (otherInput) {
+                                    modalContainer = otherInput.closest('form, fieldset, [class*="rounded"], div.p-4, div') || otherInput.parentElement?.parentElement;
+                                }
+                            }
+
+                            const isModalActive = !!modalContainer;
+                            const container = modalContainer || document;
+
+                            const isConfirmAction = escapedText.toLowerCase() === 'onayla' || escapedText.toLowerCase() === 'confirm' || escapedText.toLowerCase() === 'evet' || escapedText.toLowerCase() === 'yes';
+                            const isRejectAction = escapedText.toLowerCase() === 'reddet' || escapedText.toLowerCase() === 'reject' || escapedText.toLowerCase() === 'hayır' || escapedText.toLowerCase() === 'no' || escapedText.toLowerCase() === 'skip' || escapedText.toLowerCase() === 'atla' || escapedText.toLowerCase() === 'iptal' || escapedText.toLowerCase() === 'cancel' || escapedText.toLowerCase() === '/stop';
+
+                            if (isModalActive && (isConfirmAction || isRejectAction)) {
+                                const allBtns = Array.from(container.querySelectorAll('button')).filter(b => isVisible(b) && !isExcluded(b));
+                                const btnTarget = isConfirmAction 
+                                    ? allBtns.find(b => {
+                                        const t = (b.textContent || '').trim().toLowerCase();
+                                        return t.includes('submit') || t.includes('gönder') || t.includes('approve') || t.includes('allow') || t.includes('confirm') || t.includes('proceed') || t.includes('onayla');
+                                    })
+                                    : allBtns.find(b => {
+                                        const t = (b.textContent || '').trim().toLowerCase();
+                                        return t.includes('skip') || t.includes('cancel') || t.includes('iptal') || t.includes('reject') || t.includes('deny') || t.includes('dismiss') || t.includes('atla');
+                                    });
+
+                                if (btnTarget) {
+                                    btnTarget.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                    btnTarget.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                    btnTarget.click();
+                                    return { found: true, method: 'modal_button', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                                }
+                            }
+
+                            if (isModalActive) {
+                                const optionItems = Array.from(container.querySelectorAll(
+                                    'label, [role="radio"], [role="checkbox"], input[type="radio"], input[type="checkbox"], [data-testid*="option"], div[class*="cursor-pointer"], li'
+                                )).filter(el => isVisible(el) && !isExcluded(el));
+
+                                const totalOptions = Math.max(optionItems.length, interactiveElements.length);
+                                const optIndex = parseInt(escapedText) - 1;
+
+                                // A: Selection by option number (1, 2, 3...)
+                                if (!Number.isNaN(optIndex) && optIndex >= 0 && escapedText.match(/^\\d+$/) && optIndex < totalOptions) {
+                                    const targetEl = interactiveElements[optIndex] || optionItems[optIndex];
+                                    if (targetEl) {
+                                        targetEl.scrollIntoView({ block: 'nearest' });
+                                        targetEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                        targetEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                        targetEl.click();
+                                        const innerInput = targetEl.querySelector ? targetEl.querySelector('input') : null;
+                                        if (innerInput && innerInput !== targetEl) {
+                                            innerInput.click();
+                                            innerInput.dispatchEvent(new Event('change', { bubbles: true }));
+                                        }
+
+                                        const allBtns = Array.from(document.querySelectorAll('button')).filter(b => isVisible(b) && !isExcluded(b));
+                                        const sb = allBtns.find(b => {
+                                            const t = (b.textContent || '').trim().toLowerCase();
+                                            return t.includes('submit') || t.includes('gönder') || t.includes('proceed') || t.includes('allow') || t.includes('onayla');
+                                        });
+                                        if (sb) setTimeout(() => {
+                                            sb.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                            sb.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                            sb.click();
+                                        }, 100);
+                                        return { found: true, method: 'radio', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                                    }
+                                }
+
+                                // B: Selection by option text match
+                                const matchingEl = optionItems.find(el => {
+                                    const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                    const cleanPrompt = escapedText.trim().toLowerCase();
+                                    return t && cleanPrompt && (t.includes(cleanPrompt) || cleanPrompt.includes(t));
+                                });
+                                if (matchingEl) {
+                                    matchingEl.scrollIntoView({ block: 'nearest' });
+                                    matchingEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                    matchingEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                    matchingEl.click();
+                                    const allBtns = Array.from(document.querySelectorAll('button')).filter(b => isVisible(b) && !isExcluded(b));
+                                    const sb = allBtns.find(b => {
+                                        const t = (b.textContent || '').trim().toLowerCase();
+                                        return t.includes('submit') || t.includes('gönder') || t.includes('proceed') || t.includes('allow') || t.includes('onayla');
+                                    });
+                                    if (sb) setTimeout(() => sb.click(), 100);
+                                    return { found: true, method: 'option_text_match', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                                }
+
+                                // C: Check for write-in textarea or input
+                                const writeIn = container.querySelector('textarea:not([disabled]), input[type="text"]:not([disabled])') ||
+                                                Array.from(document.querySelectorAll('textarea, input[type="text"]')).find(t => {
+                                                    if (!isVisible(t) || isExcluded(t) || t.classList.contains('xterm')) return false;
+                                                    const ph = (t.placeholder || '').toLowerCase();
+                                                    return ph.includes('other') || ph.includes('answer') || ph.includes('diğer');
+                                                });
+                                if (writeIn && isVisible(writeIn)) {
+                                    writeIn.focus();
+                                    const setter = Object.getOwnPropertyDescriptor(writeIn.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set;
+                                    if (setter) setter.call(writeIn, escapedText);
+                                    else writeIn.value = escapedText;
+
+                                    writeIn.dispatchEvent(new Event('input', { bubbles: true }));
+                                    writeIn.dispatchEvent(new Event('change', { bubbles: true }));
+
+                                    const allBtns = Array.from(document.querySelectorAll('button')).filter(b => isVisible(b) && !isExcluded(b));
+                                    const sb = allBtns.find(b => {
+                                        const t = (b.textContent || '').trim().toLowerCase();
+                                        return t.includes('submit') || t.includes('gönder') || t.includes('proceed') || t.includes('allow') || t.includes('onayla');
+                                    });
+                                    if (sb) setTimeout(() => sb.click(), 100);
+                                    return { found: true, method: 'write-in', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                                }
+
+                                // D: If modal is active but user wants to send a regular prompt/command and Skip button exists:
+                                const allBtns = Array.from(container.querySelectorAll('button')).filter(b => isVisible(b) && !isExcluded(b));
+                                const skipBtn = allBtns.find(b => {
+                                    const t = (b.textContent || '').trim().toLowerCase();
+                                    return t.includes('skip') || t.includes('cancel') || t.includes('atla') || t.includes('iptal') || t.includes('dismiss');
+                                });
+                                if (skipBtn) {
+                                    skipBtn.click();
+                                    await new Promise(r => setTimeout(r, 200));
+                                    // Fall through to regular chat input below!
+                                }
+                            }
+                            
+                            // Use the robust centralized locator to find the actual chat input
+                            const editor = AG_UI.getChatInput();
+                            
+                            if (!editor) return { found: false, reason: "no_editor", editorCount: 0 };
+
+                            if (slashCommand && preparedSlashCommand && preparedSlashCommand.chipInserted) {
+                                // The chip was already created and any args typed into the composer by preparedSlashCommand!
+                            } else {
+                                editor.focus();
+                                try {
+                                    document.execCommand("selectAll", false, null);
+                                    document.execCommand("delete", false, null);
+                                } catch(e) {}
+
+                                let inserted = false;
+                                try { inserted = !!document.execCommand("insertText", false, escapedText); } catch(e) {}
+                                
+                                if (!inserted) {
+                                    if (editor.tagName === 'TEXTAREA') {
+                                        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+                                        if (setter) setter.call(editor, escapedText);
+                                        else editor.value = escapedText;
+                                    } else {
+                                        editor.textContent = escapedText;
+                                    }
+                                    editor.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, inputType: "insertText", data: escapedText }));
+                                    editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: escapedText }));
+                                    editor.dispatchEvent(new Event("change", { bubbles: true }));
+                                }
+                            }
+
+                            // Use setTimeout instead of requestAnimationFrame so it doesn't hang when minimized!
+                            await new Promise(r => setTimeout(r, 150));
+
+                            // Dismiss any autocomplete/suggestion popups that may have appeared
+                            // (e.g., when text starts with '/' the IDE opens a slash command popup)
+                            editor.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Escape', code: 'Escape', keyCode: 27 }));
+                            editor.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Escape', code: 'Escape', keyCode: 27 }));
+                            await new Promise(r => setTimeout(r, 100));
+
+                            // Find the submit button near the editor (within same panel)
+                            const panelContainer = editor.closest('#antigravity') || editor.closest('#conversation') || document;
+                            // Primary: aria-label based search (most reliable in newer IDE)
+                            const submitTexts = ${JSON.stringify(SUBMIT_ACTION_TEXTS)};
+                            let submit = Array.from(panelContainer.querySelectorAll('button')).find(b => {
+                                if (b.offsetParent === null) return false;
+                                const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.textContent || '')).trim().toLowerCase();
+                                return submitTexts.some(text => label === text || label.includes(text));
+                            });
+                            // Secondary: SVG icon search
+                            if (!submit) {
+                                submit = panelContainer.querySelector("svg.lucide-arrow-right, svg.lucide-arrow-up, svg[class*='arrow-right'], svg[class*='arrow-up'], svg[class*='send']")?.closest("button");
+                            }
+                            if (!submit) {
+                                const allBtns = Array.from(panelContainer.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+                                submit = allBtns.find(b => {
+                                    const text = (b.textContent || '').trim().toLowerCase();
+                                    return submitTexts.some(action => text === action || text.startsWith(action + ' '));
+                                });
+                            }
+                            
+                            if (submit && !submit.disabled) {
+                                setTimeout(() => submit.click(), 10);
+                                return { found: true, method: 'button', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                            }
+
+                            setTimeout(() => {
+                                ['keydown', 'keypress', 'keyup'].forEach(type => {
+                                    editor.dispatchEvent(new KeyboardEvent(type, { bubbles: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+                                });
+                            }, 10);
+                            return { found: true, method: 'keyboard', target: '${target.title?.substring(0, 30) || 'unknown'}' };
+                        } catch(err) {
+                            return { found: false, reason: err.message };
+                        }
+                    })()
+                `,
+                awaitPromise: true,
+                returnByValue: true
+            }), 8000, "CDP evaluate timeout");
+            const val = focusResult?.result?.value;
+            console.log(`sendViaCDP [${target.title?.substring(0, 30)}]: result =`, JSON.stringify(val));
+            
+            if (val && val.found) {
+                await new Promise(r => setTimeout(r, 50));
+                try {
+                    const dispatchNativeClick = async (rect) => {
+                        if (!rect || !Number.isFinite(rect.centerX) || !Number.isFinite(rect.centerY)) return;
+                        await Input.dispatchMouseEvent({ type: 'mouseMoved', x: rect.centerX, y: rect.centerY, button: 'none' });
+                        await Input.dispatchMouseEvent({ type: 'mousePressed', x: rect.centerX, y: rect.centerY, button: 'left', clickCount: 1 });
+                        await Input.dispatchMouseEvent({ type: 'mouseReleased', x: rect.centerX, y: rect.centerY, button: 'left', clickCount: 1 });
+                    };
+
+                    if (val.slashOptionRect) {
+                        await dispatchNativeClick(val.slashOptionRect);
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(val, 'nativeTextAfterSelect')) {
+                        await Input.insertText({ text: val.nativeTextAfterSelect || '' });
+                        await new Promise(r => setTimeout(r, 200));
+                    }
+
+                    let isMac = process.platform === 'darwin';
+                    try {
+                        const versionInfo = await client.send('Browser.getVersion');
+                        if (versionInfo && versionInfo.userAgent) {
+                            isMac = versionInfo.userAgent.includes('Macintosh') || versionInfo.userAgent.includes('Mac OS X');
+                        }
+                    } catch (_) {}
+                    const nativeEnter = isMac ? 36 : 13;
+
+                    await Input.dispatchKeyEvent({ type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: nativeEnter, text: '\r' });
+                    await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: nativeEnter });
+                } catch(e) {}
+                await client.close();
+                console.log(`sendViaCDP: Successfully sent via ${val.method} on "${target.title?.substring(0, 40)}"`);
+                return target.id;
+            } else if (val && val.reason === "invalid_modal_option") {
+                await client.close();
+                return "INVALID_MODAL_OPTION";
+            }
+            
+            if (val) errors.push(`${target.title?.substring(0, 25)}: ${val.reason || 'no_editor'}`);
+            await client.close();
+        } catch(e) {
+            if (e.message.includes('Promise was collected')) {
+                console.log(`[sendViaCDP] Ignoring Promise was collected for ${target.title}, assuming success!`);
+                try { if (client) await client.close(); } catch(_) {}
+                return target.id;
+            }
+            errors.push(`${target.title?.substring(0, 25)}: ${e.message}`);
+            try { if (client) await client.close(); } catch(_) {}
+        }
+    }
+    console.log("sendViaCDP: Failed on all targets:", errors.join(' | '));
+    throw new Error("no_chat_input");
+}
+
+async function triggerNewChat(port) {
+    const candidates = await resolveTargets(port, false);
+    const activeWsStr = activeWorkspaceName ? JSON.stringify(activeWorkspaceName.toLowerCase()) : 'null';
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            const res = await Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (() => {
+                        const activeWs = ${activeWsStr};
+                        if (activeWs) {
+                            const cards = Array.from(document.querySelectorAll('[data-project-card="true"], [data-workspace-card="true"]'));
+                            const targetCard = cards.find(card => {
+                                const cloned = card.cloneNode(true);
+                                cloned.querySelectorAll('svg').forEach(el => el.remove());
+                                const wsNameRaw = cloned.textContent.trim();
+                                const wsNameCleaned = wsNameRaw.replace(/\\s+\\d+$/, '').trim().toLowerCase();
+                                return wsNameCleaned === activeWs || wsNameCleaned.includes(activeWs) || activeWs.includes(wsNameCleaned);
+                            });
+                            
+                            if (targetCard) {
+                                // Standalone Agent 2.0 new conversation link
+                                const parent = targetCard.parentElement;
+                                const newConvLink = parent ? parent.querySelector('a[aria-label*="New Conversation" i]') : null;
+                                if (newConvLink && typeof newConvLink.click === 'function') {
+                                    newConvLink.click();
+                                    return { clicked: true, tag: newConvLink.tagName, type: 'workspace-specific-link' };
+                                }
+
+                                const plusIcon = targetCard.querySelector('button[aria-label*="New" i], svg.lucide-plus, svg.lucide-message-square-plus, svg[class*="plus"]') || 
+                                                 targetCard.querySelector('path[d="M450-450H220v-60H450V-740h60v230H740v60H510v230H450V-450Z"]');
+                                const plusBtn = plusIcon?.closest('button, [role="button"], a') || (plusIcon && plusIcon.parentElement);
+                                
+                                if (plusBtn && typeof plusBtn.click === 'function') {
+                                    plusBtn.click();
+                                    return { clicked: true, tag: plusBtn.tagName, type: 'workspace-specific' };
+                                } else {
+                                    // Fallback: targetCard might be a link or have its own click behavior 
+                                    // if there's no explicitly separated + button but we expect workspace to activate
+                                    const parent = targetCard.closest('[role="button"]') || targetCard.parentElement;
+                                    if (parent) {
+                                        const pPlusIcon = parent.querySelector('button[aria-label*="New" i], svg.lucide-plus, svg.lucide-message-square-plus, svg[class*="plus"]');
+                                        const pPlusBtn = pPlusIcon?.closest('button, [role="button"], a') || pPlusIcon?.parentElement || pPlusIcon;
+                                        if (pPlusBtn && typeof pPlusBtn.click === 'function') {
+                                            pPlusBtn.click();
+                                            return { clicked: true, tag: pPlusBtn.tagName, type: 'workspace-specific-parent' };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        const btn = AG_UI.getNewChatButton();
+                        if (btn && typeof btn.click === 'function') {
+                            btn.click();
+                            return { clicked: true, tag: btn.tagName, type: 'generic' };
+                        }
+                        return { clicked: false };
+                    })()
+                `, returnByValue: true
+            });
+            await client.close();
+            const val = res.result?.value;
+            if (val) {
+                console.log('[triggerNewChat] Result:', JSON.stringify(val));
+                if (val.clicked) return true;
+            }
+        } catch(e) {
+            console.log('[triggerNewChat] Error on target:', e.message);
+        }
+    }
+    return false;
+}
+
+
+
+async function triggerModelMenu(port) {
+    const raw = await resolveTargets(port, false);
+    const candidates = raw;
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime, Input } = client;
+            await Runtime.enable();
+            const res = await Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (() => {
+                        const btn = AG_UI.getModelSelectorButton();
+                        if (btn) {
+                            const ariaControls = btn.getAttribute('aria-controls');
+                            const popoverEl = ariaControls ? document.getElementById(ariaControls) : null;
+                            const isExpanded = btn.getAttribute('aria-expanded') === 'true' || (popoverEl && AG_UI.isVisible(popoverEl)) || AG_UI.getModelOptions().filter(AG_UI.isVisible).length > 1;
+                            if (!isExpanded) {
+                                btn.focus();
+                                const rect = btn.getBoundingClientRect();
+                                const clientX = rect.left + rect.width / 2;
+                                const clientY = rect.top + rect.height / 2;
+                                const screenX = window.screenX + clientX;
+                                const screenY = window.screenY + clientY;
+
+                                const pDown = new PointerEvent('pointerdown', {
+                                    bubbles: true, cancelable: true, composed: true, view: window,
+                                    detail: 1, screenX, screenY, clientX, clientY,
+                                    button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true
+                                });
+                                const mDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true, composed: true, view: window, detail: 1, screenX, screenY, clientX, clientY, button: 0 });
+                                const pUp = new PointerEvent('pointerup', {
+                                    bubbles: true, cancelable: true, composed: true, view: window,
+                                    detail: 1, screenX, screenY, clientX, clientY,
+                                    button: 0, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true
+                                });
+                                const mUp = new MouseEvent('mouseup', { bubbles: true, cancelable: true, composed: true, view: window, detail: 1, screenX, screenY, clientX, clientY, button: 0 });
+                                const click = new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window, detail: 1, screenX, screenY, clientX, clientY, button: 0 });
+
+                                btn.dispatchEvent(pDown);
+                                btn.dispatchEvent(mDown);
+                                btn.dispatchEvent(pUp);
+                                btn.dispatchEvent(mUp);
+                                btn.dispatchEvent(click);
+                            }
+                            return true;
+                        }
+                        return false;
+                    })()
+                `, returnByValue: true
+            });
+
+            let isOpen = false;
+            for (let i = 0; i < 6; i++) {
+                await new Promise(r => setTimeout(r, 50));
+                const pollRes = await Runtime.evaluate({
+                    expression: `
+                        ${DriverFactory.getDriver().getLocatorsScript()}
+                        (() => AG_UI.getModelOptions().filter(AG_UI.isVisible).length > 1)()
+                    `, returnByValue: true
+                });
+                if (pollRes.result?.value) {
+                    isOpen = true;
+                    break;
+                }
+            }
+
+            if (!isOpen && Input) {
+                await Input.dispatchKeyEvent({ type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                await new Promise(r => setTimeout(r, 150));
+            }
+
+            await client.close();
+            if (res.result?.value) return true;
+        } catch(e) {}
+    }
+    return false;
+}
+
+async function listAgentThreads(port) {
+    const candidates = await resolveTargets(port, false);
+    const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+    const allWorkspaces = [];
+    const driver = DriverFactory.getDriver();
+    
+    let popupCollected = false;
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            
+            if (driver.appType === 'ide') {
+                if (!popupCollected) {
+                    const openRes = await Runtime.evaluate({
+                        expression: `(() => {
+                            const existing = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
+                            if (existing) return "already-open";
+                            const icon = document.querySelector('[data-past-conversations-toggle="true"], [data-tooltip-id="history-tooltip"], [data-tooltip-id*="history" i], button[aria-label*="history" i], a[aria-label*="history" i], [role="button"][aria-label*="history" i], button[aria-label*="conversation" i], a[aria-label*="conversation" i], button[title*="Recent Sessions" i], a[title*="Recent Sessions" i], svg.lucide-history, .codicon-history');
+                            if (!icon) return "no-icon";
+                            (icon.closest("button") || icon.closest("a") || icon.parentElement || icon).click();
+                            return "opened";
+                        })()`
+                    });
+                    
+                    if (openRes.result?.value !== 'no-icon') {
+                        await new Promise(r => setTimeout(r, openRes.result?.value === 'opened' ? 800 : 200));
+                        
+                        // Expand all "show more" buttons (e.g. fastpick-show-more-Recent, fastpick-show-more-Running)
+                        await Runtime.evaluate({
+                            expression: `(() => {
+                                const showMoreEls = Array.from(document.querySelectorAll('[id^="fastpick-show-more-"], [id*="show-more"]'));
+                                if (showMoreEls.length === 0) {
+                                    const textMatches = Array.from(document.querySelectorAll('div')).filter(d => /^show\\s+\\d+\\s+more/i.test(d.textContent.trim()));
+                                    textMatches.forEach(el => el.click());
+                                } else {
+                                    showMoreEls.forEach(el => el.click());
+                                }
+                            })()`
+                        });
+                        await new Promise(r => setTimeout(r, 600));
+
+                        const popupRes = await Runtime.evaluate({
+                            expression: driver.getListAgentThreadsScript(),
+                            returnByValue: true
+                        });
+                        
+                        // Close popup
+                        await Runtime.evaluate({
+                            expression: `(() => {
+                                document.body.click();
+                                const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
+                                document.activeElement.dispatchEvent(esc);
+                                document.dispatchEvent(esc);
+                            })()`
+                        });
+                        
+                        const popupWorkspaces = JSON.parse(popupRes.result?.value || '[]');
+                        if (popupWorkspaces && popupWorkspaces.length > 0) {
+                            for (const pw of popupWorkspaces) {
+                                const existing = allWorkspaces.find(w => normalize(w.workspace) === normalize(pw.workspace));
+                                if (existing) {
+                                    for (const t of pw.threads) {
+                                        if (!existing.threads.some(et => et.name === t.name)) existing.threads.push(t);
+                                    }
+                                } else {
+                                    allWorkspaces.push(pw);
+                                }
+                            }
+                            popupCollected = true;
+                        }
+                    }
+                }
+            } else {
+                // Standalone 2.0 extraction
+                const homeRes = await Runtime.evaluate({
+                    expression: driver.getListAgentThreadsScript(),
+                    awaitPromise: true,
+                    returnByValue: true
+                });
+                
+                const homeWorkspaces = JSON.parse(homeRes.result?.value || '[]');
+                for (const hw of homeWorkspaces) {
+                    const existing = allWorkspaces.find(w => normalize(w.workspace) === normalize(hw.workspace));
+                    if (existing) {
+                        for (const t of hw.threads) {
+                            if (!existing.threads.some(et => et.name === t.name)) existing.threads.push(t);
+                        }
+                    } else {
+                        allWorkspaces.push(hw);
+                    }
+                }
+                
+                if (homeWorkspaces.length > 0) {
+                    // Standalone targets usually have all threads on a single target if it's the home screen
+                    popupCollected = true; 
+                }
+            }
+            
+            await client.close();
+            
+            if (popupCollected && driver.appType !== 'ide') {
+                break;
+            }
+        } catch(e) { console.debug(`[listAgentThreads] window error: ${e.message}`); }
+    }
+    
+    return allWorkspaces;
+}
+
+function setActiveWorkspace(name) {
+    activeWorkspaceName = name ? name.toLowerCase() : null;
+    lastResolvedThreadId = null;
+    preferredTargetId = null;
+}
+
+async function switchAgentThread(port, threadName, targetWorkspaceName = null, targetThreadId = null) {
+    const candidates = await resolveTargets(port, false);
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            
+            const driver = DriverFactory.getDriver();
+            const threadNameStr = JSON.stringify(threadName);
+            const targetWsNameStr = targetWorkspaceName ? JSON.stringify(targetWorkspaceName.toLowerCase()) : 'null';
+            
+            if (driver.appType === 'agent') {
+                let threadId = targetThreadId;
+                if (!threadId && threadNameToIdCache.has(threadName)) {
+                    threadId = threadNameToIdCache.get(threadName);
+                }
+
+                if (threadId) {
+                    const directRes = await Runtime.evaluate({
+                        expression: `(() => {
+                            const targetId = ${JSON.stringify(threadId)};
+                            const link = document.querySelector('a[href*="' + targetId + '"]');
+                            if (link) {
+                                link.click();
+                                return 'clicked';
+                            }
+                            window.location.href = window.location.origin + '/c/' + targetId;
+                            return 'clicked';
+                        })()`,
+                        returnByValue: true
+                    });
+
+                    await client.close();
+                    if (directRes.result?.value === 'clicked') {
+                        console.log(`[switchAgentThread] Direct switched to thread ID "${threadId}", waiting 1200ms...`);
+                        await new Promise(r => setTimeout(r, 1200));
+                        lastResolvedThreadId = threadId;
+                        _notifyThreadResolved(threadId);
+                        threadNameToIdCache.set(threadName, threadId);
+                        return target.id;
+                    }
+                }
+
+                const clickRes = await Runtime.evaluate({
+                    expression: driver.getSwitchThreadScript(threadNameStr, targetWsNameStr),
+                    awaitPromise: true,
+                    returnByValue: true
+                });
+                
+                await client.close();
+                
+                if (clickRes.result?.value === 'clicked') {
+                    console.log(`[switchAgentThread] Clicked standalone thread "${threadName}", waiting 2500ms...`);
+                    await new Promise(r => setTimeout(r, 2500));
+                    
+                    // Read the new URL from the page to extract conversation ID directly
+                    try {
+                        const client2 = await CDP({ target: target.webSocketDebuggerUrl });
+                        const { Runtime: Runtime2 } = client2;
+                        await Runtime2.enable();
+                        const urlRes = await Runtime2.evaluate({
+                            expression: `window.location.href`,
+                            returnByValue: true
+                        });
+                        await client2.close();
+                        
+                        const href = urlRes.result?.value || '';
+                        const uuidMatch = href.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                        if (uuidMatch) {
+                            const conversationId = uuidMatch[1];
+                            console.log(`[switchAgentThread] Extracted conversation ID from URL: ${conversationId}`);
+                            lastResolvedThreadId = conversationId;
+                            _notifyThreadResolved(conversationId);
+                            threadNameToIdCache.set(threadName, conversationId);
+                        }
+                    } catch (urlErr) {
+                        console.log(`[switchAgentThread] Could not read URL after click: ${urlErr.message}`);
+                    }
+                    
+                    return target.id;
+                } else if (clickRes.result?.value === 'already-active') {
+                    console.log(`[switchAgentThread] Thread "${threadName}" is already active.`);
+                    return target.id;
+                }
+                console.log(`[switchAgentThread] Standalone thread "${threadName}" not found. Result: ${clickRes.result?.value}`);
+                continue;
+            }
+            
+            // Fallback for Classic IDE:
+            const openRes = await Runtime.evaluate({
+                expression: driver.getSwitchThreadScript()
+            });
+            if (openRes.result?.value === 'no-icon') { await client.close(); continue; }
+            await new Promise(r => setTimeout(r, openRes.result?.value === 'opened' ? 800 : 200));
+            
+            // Filter the quickpick list by typing the thread name to handle virtualization
+            await Runtime.evaluate({
+                expression: `(() => {
+                    const input = document.querySelector('input[placeholder*="Search all"], input[placeholder="Select a conversation"], input[placeholder*="convo"]');
+                    if (input) {
+                        input.focus();
+                        input.value = '';
+                        try { document.execCommand("insertText", false, ${threadNameStr}); } catch(e) {}
+                        if (!input.value) {
+                            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                            if (setter) setter.call(input, ${threadNameStr});
+                            else input.value = ${threadNameStr};
+                        }
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                })()`
+            });
+            
+            await new Promise(r => setTimeout(r, 600)); // Wait for filtering animation
+            
+            const res = await Runtime.evaluate({
+                expression: driver.getSwitchThreadQuickpickScript(threadNameStr),
+                awaitPromise: true,
+                returnByValue: true
+            });
+            await client.close();
+            if (res.result?.value) {
+                // Step 4: Handle "Select where to open the conversation" popup
+                // When selecting a thread from a different workspace, the IDE shows
+                // a quickpick asking where to open it. We prefer "Open in workspace".
+                await new Promise(r => setTimeout(r, 500));
+                let didClickWorkspace = false;
+                try {
+                    const client2 = await CDP({ target: target.webSocketDebuggerUrl });
+                    const { Runtime: Runtime2 } = client2;
+                    await Runtime2.enable();
+                    const qRes = await Runtime2.evaluate({
+                        expression: `(() => {
+                            const items = Array.from(document.querySelectorAll('[role="option"], .quick-input-list-entry, .monaco-list-row'));
+                            const wsOption = items.find(el => {
+                                const text = (el.textContent || '').toLowerCase();
+                                return text.includes('open in workspace') || text.includes('workspace:');
+                            });
+                            const currentOption = items.find(el => {
+                                const text = (el.textContent || '').toLowerCase();
+                                return text.includes('open in current window') || text.includes('current window');
+                            });
+                            
+                            const targetOption = wsOption || currentOption;
+                            if (targetOption) {
+                                targetOption.scrollIntoView();
+                                targetOption.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                targetOption.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                targetOption.click();
+                                return targetOption === wsOption ? 'workspace' : 'current';
+                            }
+                            return null;
+                        })()`,
+                        returnByValue: true
+                    });
+                    didClickWorkspace = qRes.result?.value === 'workspace';
+                    await client2.close();
+                } catch(_) { /* popup may not appear for same-workspace threads */ }
+                
+                let finalTargetId = target.id;
+                let finalWsUrl = target.webSocketDebuggerUrl;
+
+                if (didClickWorkspace && targetWorkspaceName) {
+                    console.log(`[switchAgentThread] Clicked 'Open in workspace'. Waiting for new window for: ${targetWorkspaceName}`);
+                    const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+                    const searchName = normalize(targetWorkspaceName);
+                    
+                    let foundNewTarget = null;
+                    for (let i = 0; i < 15; i++) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        try {
+                            // Fetch raw targets without activeWorkspaceName filter bias
+                            const raw = await httpGet(`http://127.0.0.1:${port}/json`);
+                            const targets = JSON.parse(raw);
+                            foundNewTarget = targets.find(t => 
+                                (t.type === 'page' || t.type === 'webview') &&
+                                t.webSocketDebuggerUrl &&
+                                !t.url.includes('devtools://') &&
+                                normalize(t.title).includes(searchName)
+                            );
+                            if (foundNewTarget) break;
+                        } catch(e) {}
+                    }
+                    if (foundNewTarget) {
+                        console.log(`[switchAgentThread] Found new window target: ${foundNewTarget.id}`);
+                        finalTargetId = foundNewTarget.id;
+                        finalWsUrl = foundNewTarget.webSocketDebuggerUrl;
+                    }
+                }
+
+                // Step 5: Wait for the new thread's chat input to become ready.
+                // Without this, the first message after switching gets lost because
+                // the editor hasn't loaded yet.
+                for (let waitAttempt = 0; waitAttempt < 10; waitAttempt++) {
+                    await new Promise(r => setTimeout(r, 500));
+                    try {
+                        const client3 = await CDP({ target: finalWsUrl });
+                        const { Runtime: Runtime3 } = client3;
+                        await Runtime3.enable();
+                        const readyCheck = await Runtime3.evaluate({
+                            expression: `(() => {
+                                const editors = [...document.querySelectorAll('[contenteditable="true"]')]
+                                    .filter(el => !el.className.includes('xterm') && el.offsetParent !== null);
+                                return editors.length > 0;
+                            })()`,
+                            returnByValue: true
+                        });
+                        await client3.close();
+                        if (readyCheck.result?.value) {
+                            console.log(`[switchAgentThread] Chat input ready after ${(waitAttempt + 1) * 500}ms`);
+                            break;
+                        }
+                    } catch(_) {}
+                }
+                
+                return finalTargetId;
+            }
+        } catch(e) { console.debug(`[switchAgentThread] error: ${e.message}`); }
+    }
+    return null;
+}
+
+async function getActiveThreadInfo(port, specificTargetId = null) {
+    let threadId = null;
+    let threadName = null;
+    let workspaceName = null;
+
+    let candidates = await resolveTargets(port, false);
+    if (specificTargetId) {
+        const filtered = candidates.filter(t => t.id === specificTargetId); if (filtered.length > 0) candidates = filtered;
+    }
+    // 1. Try to get Name, Workspace, and Thread ID from the DOM
+    for (const target of candidates) {
+        try {
+            const client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 2000, "CDP timeout");
+            const { Runtime } = client;
+            await Runtime.enable();
+            const driver = DriverFactory.getDriver();
+            const res = await withTimeout(Runtime.evaluate({
+                expression: driver.getActiveThreadInfoScript(),
+                awaitPromise: true,
+                returnByValue: true
+            }), 3000, "Evaluate timeout");
+            await client.close();
+            if (res.result?.value) {
+                if (res.result.value.name && !threadName) threadName = res.result.value.name;
+                if (res.result.value.threadId && !threadId) threadId = res.result.value.threadId;
+                
+                let wsName = res.result.value.workspace;
+                if (wsName && wsName.includes(' - ')) wsName = wsName.split(' - ')[0].trim();
+                if (wsName && wsName !== 'undefined' && wsName !== 'Launchpad') {
+                    if (!workspaceName) workspaceName = wsName;
+                }
+                
+                // Only break if we got a REAL thread name (not just workspace/title fallback)
+                // If threadId was found directly from DOM, that's authoritative — break immediately
+                if (threadId) break;
+                if (threadName && res.result.value.nameSource !== 'document-title') break;
+            }
+        } catch(e) { console.debug(`[getActiveThreadInfo] target error: ${e.message}`); }
+    }
+
+    if (!threadId && threadName) {
+        threadId = findConversationIdByTitle(threadName);
+    }
+
+    // 2. Fallback: Get Thread ID via file-system logs of the app
+    // New IDE uses transcript.jsonl, legacy used overview.txt — check both
+    // If activeWorkspaceName is set or specificTargetId provides a workspace, filter by it.
+    if (!threadId) {
+        try {
+            const appDataName = DriverFactory.getDriver().appDataName;
+            const brainPath = path.join(os.homedir(), '.gemini', appDataName, 'brain');
+            if (fs.existsSync(brainPath)) {
+                const dirs = fs.readdirSync(brainPath, { withFileTypes: true });
+                let latestTime = 0;
+                
+                let filterWorkspace = null;
+                if (specificTargetId) {
+                    const c = candidates.find(t => t.id === specificTargetId);
+                    if (c && c.title) filterWorkspace = c.title.split(' - ')[0].trim();
+                } else if (activeWorkspaceName) {
+                    filterWorkspace = activeWorkspaceName;
+                }
+                
+                for (const dir of dirs) {
+                    if (!dir.isDirectory()) continue;
+                    const logsDir = path.join(brainPath, dir.name, '.system_generated', 'logs');
+                    const transcriptPath = path.join(logsDir, 'transcript.jsonl');
+                    const overviewPath = path.join(logsDir, 'overview.txt');
+                    
+                    let bestMtime = 0;
+                    try { if (fs.existsSync(transcriptPath)) bestMtime = Math.max(bestMtime, fs.statSync(transcriptPath).mtimeMs); } catch (_) {}
+                    try { if (fs.existsSync(overviewPath)) bestMtime = Math.max(bestMtime, fs.statSync(overviewPath).mtimeMs); } catch (_) {}
+                    
+                    if (bestMtime > latestTime) {
+                        // Apply workspace filtering if required
+                        let match = true;
+                        if (filterWorkspace) {
+                            match = false;
+                            const logPath = fs.existsSync(transcriptPath) ? transcriptPath : (fs.existsSync(overviewPath) ? overviewPath : null);
+                            if (logPath) {
+                                try {
+                                    const stats = fs.statSync(logPath);
+                                    const head = fs.readFileSync(logPath, 'utf8').substring(0, 8000);
+                                    const normalize = (s) => (s || '').toLowerCase().replace(/[-_]/g, ' ');
+                                    const workspaceNameNormalized = normalize(filterWorkspace);
+                                    
+                                    let foundInUserInfo = false;
+                                    const userInfoMatch = head.match(/<user_information>([\s\S]*?)<\/user_information>/);
+                                    if (userInfoMatch) {
+                                        const userInfo = userInfoMatch[1];
+                                        // Match format: /path/to/workspace -> workspaceName
+                                        foundInUserInfo = userInfo.includes(`/${filterWorkspace} ->`) || 
+                                                          userInfo.includes(`\\\\${filterWorkspace} ->`) ||
+                                                          userInfo.includes(`/${filterWorkspace}`) ||
+                                                          userInfo.includes(`-> ${filterWorkspace}`);
+                                    }
+
+                                    if (foundInUserInfo) {
+                                        match = true;
+                                    } else {
+                                        // Allow extremely recent new threads (modified within last 90 seconds, size under 8KB)
+                                        // since new threads won't contain workspace path references yet in their first user step.
+                                        const ageMs = Date.now() - stats.mtimeMs;
+                                        if (ageMs < 90000 && stats.size < 8000) {
+                                            match = true;
+                                        }
+                                    }
+                                } catch (_) {}
+                            }
+                        }
+                        
+                        if (match) {
+                            latestTime = bestMtime;
+                            threadId = dir.name;
+                        }
+                    }
+                }
+            }
+        } catch(e) { console.debug(`[getActiveThreadInfo] fallback error: ${e.message}`); }
+    }
+
+    if (!workspaceName && activeWorkspaceName) {
+        workspaceName = activeWorkspaceName;
+    }
+
+    if (threadId || workspaceName) {
+        return { id: threadId, name: threadName, workspace: workspaceName };
+    }
+    return null;
+}
+
+async function getActiveThreadId(port, specificTargetId = null) {
+    const info = await getActiveThreadInfo(port, specificTargetId);
+    return info ? info.id : null;
+}
+async function isAgentWorking(port, specificTargetId = null) {
+    let candidates = await resolveTargets(port, false);
+    if (specificTargetId) {
+        const filtered = candidates.filter(t => t.id === specificTargetId); if (filtered.length > 0) candidates = filtered;
+    }
+    for (const target of candidates) {
+        try {
+            const client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 2000, "CDP timeout");
+            const { Runtime } = client;
+            await Runtime.enable();
+            const check = await withTimeout(Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (function() {
+                        const container = document.querySelector('.antigravity-agent-side-panel, .modal, [role="dialog"], .interactive-session') || document;
+                        const isModal = !!container.querySelector('textarea[placeholder*="Other" i], textarea[placeholder*="answer" i], input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], select, [data-testid="interactive-modal"]');
+
+                        const isGenerating = !!AG_UI.getStopButton();
+                        const editor = AG_UI.getChatInput();
+                        const isInputDisabled = editor ? (editor.getAttribute('contenteditable') === 'false' || editor.disabled) : false;
+                        const isSpinning = AG_UI.isLoading();
+                        
+                        const aaActive = !!window.__AA_BOT_OBSERVER_ACTIVE && !window.__AA_BOT_PAUSED;
+                        let hasPendingButton = false;
+                        if (aaActive) {
+                            const texts = ['run', 'accept', 'allow', 'continue', 'retry', 'çalıştır', 'kabul et', 'izin ver', 'devam et', 'yeniden dene'];
+                            const btns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+                            hasPendingButton = btns.some(b => {
+                                const t = (b.textContent||'').trim().toLowerCase();
+                                return texts.some(x => t === x || t.startsWith(x + ' ') || (t.startsWith(x) && t.length <= x.length + 8));
+                            });
+                        }
+                        
+                        return isGenerating || (!isModal && isInputDisabled) || isSpinning || hasPendingButton;
+                    })()
+                `,
+                returnByValue: true
+            }), 3000, "Evaluate timeout");
+            await client.close();
+            if (check && check.result && check.result.value !== undefined) {
+                return check.result.value;
+            }
+        } catch(e) { console.debug(`[isAgentWorking] target error: ${e.message}`); }
+    }
+    return false;
+}
+
+let lastKnownModel = null;
+
+async function getCurrentModel(port) {
+    const candidates = await resolveTargets(port, false);
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            const check = await Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (function() {
+                        const btn = AG_UI.getModelSelectorButton();
+                        if (btn) {
+                            const label = btn.getAttribute('aria-label') || '';
+                            const current = label.match(/(?:current|当前)[：:]\\s*(.+)$/i);
+                            if (current && current[1]) return current[1].trim();
+                            const txt = btn.textContent.trim();
+                            if (txt) return txt;
+                        }
+                        return null;
+                    })()
+                `, returnByValue: true
+            });
+            await client.close();
+            if (check?.result?.value) {
+                lastKnownModel = check.result.value;
+                return check.result.value;
+            }
+        } catch(e) {}
+    }
+    return lastKnownModel || null;
+}
+
+async function switchStandaloneWorkspace(port, wsName, wsPath = null) {
+    if (!wsName) return false;
+    const candidates = await resolveTargets(port, false);
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime, Page } = client;
+            await Runtime.enable();
+            await Page.enable();
+            
+            const rawTargetStr = JSON.stringify(wsName);
+            const clickRes = await Runtime.evaluate({
+                expression: `(async () => {
+                    const rawTarget = ${rawTargetStr};
+                    const normalize = s => (s || '').toLowerCase().replace(/[^\\p{L}\\p{N}]/gu, '');
+                    const targetNorm = normalize(rawTarget);
+                    const baseNorm = normalize(rawTarget.split('/').filter(Boolean).pop() || rawTarget);
+
+                    const isMatch = (text) => {
+                        if (!text) return false;
+                        const norm = normalize(text.trim().replace(/\\s+\\d+$/, ''));
+                        return norm === targetNorm || norm === baseNorm || norm.includes(targetNorm) || targetNorm.includes(norm) || norm.includes(baseNorm) || baseNorm.includes(norm);
+                    };
+
+                    // Strategy 1: Top Project Pill Menu
+                    try {
+                        const pillBtn = Array.from(document.querySelectorAll('button')).find(b => 
+                            b.className && typeof b.className === 'string' && b.className.includes('rounded-full') &&
+                            b.parentElement?.querySelector('button[aria-label*="context" i], button[aria-label*="model" i], [data-testid*="model-selector"]')
+                        ) || Array.from(document.querySelectorAll('button')).find(b => b.className && typeof b.className === 'string' && b.className.includes('rounded-full') && !b.getAttribute('aria-label'));
+
+                        if (pillBtn) {
+                            pillBtn.click();
+                            await new Promise(r => setTimeout(r, 350));
+
+                            const menu = document.querySelector('[role="menu"], [data-base-ui-focusable]');
+                            if (menu) {
+                                const items = Array.from(menu.querySelectorAll('[role="menuitem"], div[data-base-ui-focusable], div.cursor-pointer, .main-row-trigger'));
+                                const match = items.find(i => isMatch(i.textContent));
+
+                                if (match) {
+                                    match.click();
+                                    await new Promise(r => setTimeout(r, 400));
+                                    return true;
+                                }
+                                // Close menu if not found
+                                const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true });
+                                document.activeElement?.dispatchEvent(esc);
+                                document.dispatchEvent(esc);
+                                await new Promise(r => setTimeout(r, 150));
+                            }
+                        }
+                    } catch (e) {}
+
+                    // Strategy 2: Sidebar Virtualized List (Header / New Conversation in Project)
+                    try {
+                        const scrollEl = document.querySelector(".relative.w-full.h-full.overflow-y-auto.overscroll-none.px-2") ||
+                                         Array.from(document.querySelectorAll("*")).find(el => {
+                                             const s = window.getComputedStyle(el);
+                                             return (s.overflowY === "auto" || s.overflowY === "scroll") && el.scrollHeight > el.clientHeight;
+                                         });
+
+                        const totalHeight = scrollEl ? scrollEl.scrollHeight : 0;
+                        const step = 250;
+
+                        if (scrollEl) {
+                            scrollEl.scrollTop = 0;
+                            await new Promise(r => setTimeout(r, 80));
+                        }
+
+                        for (let pos = 0; pos <= totalHeight + step; pos += step) {
+                            if (scrollEl && pos > 0) {
+                                scrollEl.scrollTop = pos;
+                                await new Promise(r => setTimeout(r, 70));
+                            }
+
+                            const headers = Array.from(document.querySelectorAll('button')).filter(b => (b.className || '').includes('headerbtn'));
+                            for (const h of headers) {
+                                if (isMatch(h.textContent)) {
+                                    const container = h.parentElement;
+                                    const newConvBtn = container ? container.querySelector('a[aria-label*="New Conversation" i], a[href*="section="]') : null;
+                                    if (newConvBtn) {
+                                        newConvBtn.click();
+                                        await new Promise(r => setTimeout(r, 400));
+                                        return true;
+                                    } else {
+                                        h.click();
+                                        await new Promise(r => setTimeout(r, 400));
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {}
+
+                    return false;
+                })()`,
+                awaitPromise: true,
+                returnByValue: true
+            });
+            
+            if (clickRes.result?.value) {
+                await client.close();
+                console.log(`[switchStandaloneWorkspace] Successfully switched workspace for: ${wsName}`);
+                return true;
+            }
+
+            // Strategy 3: URL Navigation via ?ws= (Registers/creates and opens new project in Standalone App)
+            const targetFolder = wsPath || (wsName.startsWith('/') ? wsName : null);
+            if (targetFolder) {
+                const evalRes = await Runtime.evaluate({ expression: "window.location.origin", returnByValue: true });
+                const origin = evalRes.result?.value;
+                if (origin) {
+                    const targetUrl = `${origin}/?ws=${encodeURIComponent(targetFolder)}`;
+                    console.log(`[switchStandaloneWorkspace] Registering/navigating project in Standalone App: ${targetUrl}`);
+                    await Page.navigate({ url: targetUrl });
+                    await new Promise(r => setTimeout(r, 1500));
+                    await client.close();
+                    return true;
+                }
+            }
+
+            await client.close();
+        } catch (e) {
+            console.debug(`[switchStandaloneWorkspace] Error focusing workspace ${wsName}: ${e.message}`);
+        }
+    }
+    return false;
+}
+
+async function listStandaloneWorkspaces(port) {
+    const candidates = await resolveTargets(port, false);
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+            const res = await Runtime.evaluate({
+                expression: `(async () => {
+                    const scrollEl = document.querySelector(".relative.w-full.h-full.overflow-y-auto.overscroll-none.px-2") ||
+                                     Array.from(document.querySelectorAll("*")).find(el => {
+                                         const s = window.getComputedStyle(el);
+                                         return (s.overflowY === "auto" || s.overflowY === "scroll") && el.scrollHeight > el.clientHeight;
+                                     });
+                    const totalHeight = scrollEl ? scrollEl.scrollHeight : 0;
+                    const step = 250;
+                    const origScroll = scrollEl ? scrollEl.scrollTop : 0;
+                    const allProjects = new Set();
+
+                    if (scrollEl) {
+                        scrollEl.scrollTop = 0;
+                        await new Promise(r => setTimeout(r, 60));
+                    }
+
+                    for (let pos = 0; pos <= totalHeight + step; pos += step) {
+                        if (scrollEl && pos > 0) {
+                            scrollEl.scrollTop = pos;
+                            await new Promise(r => setTimeout(r, 50));
+                        }
+                        const headers = Array.from(document.querySelectorAll("button")).filter(b => (b.className || "").includes("headerbtn"));
+                        headers.forEach(h => {
+                            const name = h.textContent.trim().replace(/\\s+\\d+$/, "");
+                            if (name && !allProjects.has(name)) {
+                                allProjects.add(name);
+                            }
+                        });
+                    }
+
+                    if (scrollEl) scrollEl.scrollTop = origScroll;
+                    return Array.from(allProjects);
+                })()`,
+                awaitPromise: true,
+                returnByValue: true
+            });
+            await client.close();
+            if (Array.isArray(res.result?.value) && res.result.value.length > 0) {
+                return res.result.value;
+            }
+        } catch (e) {}
+    }
+    return [];
+}
+
+/**
+ * Click an artifact feedback button (Proceed/Cancel) in the IDE via CDP.
+ * Searches for buttons in the chat panel that match the given label text.
+ * 
+ * @param {string} buttonLabel - The button text to find (e.g., 'Proceed', 'Cancel')
+ * @param {number} port - CDP debugging port
+ * @param {string|null} specificTargetId - Optional specific target window
+ * @returns {Promise<boolean>} true if the button was found and clicked
+ */
+async function clickArtifactButton(buttonLabel, port, specificTargetId = null) {
+    const candidates = await resolveTargets(port);
+    let targets = candidates;
+
+    if (specificTargetId) {
+        targets = candidates.filter(t => t.id && t.id.startsWith(specificTargetId));
+    } else if (preferredTargetId) {
+        targets = candidates.filter(t => t.id === preferredTargetId);
+        if (targets.length === 0) targets = candidates;
+    }
+
+    const labelLower = buttonLabel.toLowerCase();
+
+    for (const target of targets) {
+        let client;
+        try {
+            client = await withTimeout(CDP({ target: target.webSocketDebuggerUrl }), 3000, "CDP connect timeout");
+            const { Runtime } = client;
+            await Runtime.enable();
+
+            const result = await withTimeout(Runtime.evaluate({
+                expression: `
+                    (function() {
+                        // Search for the artifact feedback button by its text content
+                        var label = ${JSON.stringify(labelLower)};
+                        var allButtons = Array.from(document.querySelectorAll('button'));
+                        
+                        // Also search inside shadow roots
+                        document.querySelectorAll('*').forEach(function(el) {
+                            if (el.shadowRoot) {
+                                allButtons.push.apply(allButtons, Array.from(el.shadowRoot.querySelectorAll('button')));
+                            }
+                        });
+                        
+                        // Find buttons matching the label
+                        var candidates = allButtons.filter(function(btn) {
+                            var text = (btn.textContent || '').trim().toLowerCase();
+                            return text === label || text.startsWith(label);
+                        });
+                        
+                        if (candidates.length === 0) {
+                            return { found: false, error: 'No button found with text: ' + label };
+                        }
+                        
+                        // Prefer the LAST matching button (most recent artifact)
+                        var btn = candidates[candidates.length - 1];
+                        
+                        // Check if button is actually clickable
+                        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+                            return { found: true, clicked: false, error: 'Button is disabled' };
+                        }
+                        
+                        btn.click();
+                        try {
+                            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        } catch(e) {}
+                        
+                        return { found: true, clicked: true, text: btn.textContent.trim() };
+                    })()
+                `,
+                returnByValue: true
+            }), 8000, "clickArtifactButton timeout");
+
+            await client.close();
+
+            const val = result?.result?.value;
+            if (val && val.clicked) {
+                console.log(`[clickArtifactButton] Clicked "${val.text}" in target ${target.id.substring(0, 8)}`);
+                return true;
+            }
+            if (val && val.found && !val.clicked) {
+                console.log(`[clickArtifactButton] Button found but not clickable: ${val.error}`);
+            }
+        } catch (e) {
+            try { if (client) await client.close(); } catch (_) {}
+            console.log(`[clickArtifactButton] Error in target ${target.id?.substring(0, 8)}: ${e.message}`);
+        }
+    }
+
+    throw new Error(`Could not find or click "${buttonLabel}" button in any IDE target`);
+}
+
+module.exports = {
+    PENDING_ACTION_TEXTS,
+    SUBMIT_ACTION_TEXTS,
+    getSelectableSlashCommandForTarget,
+    findConversationIdByTitle,
+    isAgentWorking,
+    getFullLatestResponse,
+    snapshotChatState,
+    captureAgentScreenshot,
+    captureFullIDEScreenshot,
+    waitForAgentResponse,
+    sendViaCDP,
+    clickArtifactButton,
+    triggerNewChat,
+    triggerModelMenu,
+    getAvailableModels,
+    selectModel,
+    getCurrentModel,
+    stopAgent,
+    getQuota,
+    resolveTargets,
+    listWindows,
+    setPreferredWindow,
+    getPreferredWindow,
+    getPreferredTargetId,
+    getCachedWindows,
+    closeWindow,
+    closeAllEditors,
+    listAgentThreads,
+    switchAgentThread,
+    CHAT_EXTRACT_EXPR,
+    getChatExtractExpr,
+    getActiveThreadId,
+    getActiveThreadInfo,
+    setActiveWorkspace,
+    switchStandaloneWorkspace,
+    listStandaloneWorkspaces,
+    getLastResolvedThreadId, setLastResolvedThreadId,
+    setOnThreadResolved
+};
+
+async function captureFullIDEScreenshot(port) {
+    const candidates = await resolveTargets(port);
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Page } = client;
+            await Page.enable();
+
+            const screenshotResult = await Page.captureScreenshot({
+                format: 'jpeg',
+                quality: 80
+            });
+            await client.close();
+            if (screenshotResult && screenshotResult.data) {
+                return Buffer.from(screenshotResult.data, 'base64');
+            }
+        } catch(e) {}
+    }
+    throw new Error("Could not capture full screenshot via CDP");
+}
+
+async function getAvailableModels(port) {
+    const raw = await resolveTargets(port, false);
+    const candidates = raw;
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime, Input } = client;
+            await Runtime.enable();
+
+            // Step 1: Check if panel is already open or click trigger button
+            const openRes = await Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (() => {
+                        const panel = document.querySelector('[data-testid="model-selector-panel"]');
+                        if (panel && AG_UI.isVisible(panel)) return { alreadyOpen: true };
+                        const existingOptions = AG_UI.getModelOptions().filter(AG_UI.isVisible);
+                        if (existingOptions.length > 1) return { alreadyOpen: true };
+                        const btn = AG_UI.getModelSelectorButton();
+                        if (btn) {
+                            const rect = btn.getBoundingClientRect();
+                            return {
+                                clicked: true,
+                                x: rect.left + rect.width / 2,
+                                y: rect.top + rect.height / 2
+                            };
+                        }
+                        return { clicked: false };
+                    })()
+                `, returnByValue: true
+            });
+
+            if (openRes.result?.value?.x && Input) {
+                const { x, y } = openRes.result.value;
+                await Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+                await Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+                await new Promise(r => setTimeout(r, 400));
+            }
+
+            const res = await Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (async () => {
+                        const cleanModelText = (text) => (text || '')
+                            .replace(/\\s*\\(?\\b(low|medium|high)\\b\\)?\\s*/gi, ' ')
+                            .replace(/Fla\\s*h/g, 'Flash')
+                            .replace(/Fa\\s*t/g, 'Fast')
+                            .replace(/\\bopus?\\b/gi, 'Opus')
+                            .replace(/Fa\\s*t$/i, '')
+                            .replace(/New$/i, '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        
+                        const seen = new Set();
+                        const models = [];
+                        
+                        // 1. Standalone 2.0 model panel
+                        const panel = document.querySelector('[data-testid="model-selector-panel"]');
+                        if (panel) {
+                            // Effort tier groups (Gemini 3.7 Flash, Gemini 3.6 Flash, etc.)
+                            const effortGroups = Array.from(panel.querySelectorAll('[data-testid="model-selector-effort-group"]'));
+                            for (const eg of effortGroups) {
+                                const baseName = eg.textContent.trim();
+                                if (!baseName || seen.has(baseName)) continue;
+                                seen.add(baseName);
+                                models.push({
+                                    name: baseName,
+                                    baseName: baseName,
+                                    hasTiers: true,
+                                    tiers: baseName.includes('3.1 Pro') ? ['Low', 'High'] : ['Low', 'Medium', 'High'],
+                                    currentTier: 'Medium'
+                                });
+                            }
+                            
+                            // Direct items (Claude Sonnet, Claude Opus, GPT-OSS, etc.)
+                            const directItems = Array.from(panel.querySelectorAll('[data-testid="model-selector-item"]'));
+                            for (const di of directItems) {
+                                const name = di.textContent.trim();
+                                if (name && !seen.has(name)) {
+                                    seen.add(name);
+                                    models.push({
+                                        name: name,
+                                        baseName: name,
+                                        hasTiers: false,
+                                        tiers: []
+                                    });
+                                }
+                            }
+                            
+                            if (models.length > 0) return models;
+                        }
+                        
+                        // 2. Generic / IDE options
+                        const agItems = AG_UI.getModelOptions().filter(AG_UI.isVisible);
+                        if (agItems.length > 0) {
+                            for (const item of agItems) {
+                                const baseAttr = item.querySelector('[data-model-base]')?.getAttribute('data-model-base') || item.getAttribute('data-model-base');
+                                const labelAttr = item.getAttribute('data-model-label');
+                                const name = labelAttr || baseAttr || cleanModelText(item.textContent.trim().split(/\\r?\\n/)[0]);
+                                if (name && !seen.has(name)) {
+                                    seen.add(name);
+                                    const hasTiers = (name.includes('Gemini') || name.includes('Flash') || name.includes('Pro')) && !name.includes('Thinking');
+                                    models.push({
+                                        name: name,
+                                        baseName: name,
+                                        hasTiers: hasTiers,
+                                        tiers: hasTiers ? ['Low', 'Medium', 'High'] : [],
+                                        currentTier: 'Medium'
+                                    });
+                                }
+                            }
+                        }
+                        
+                        return models;
+                    })()
+                `, returnByValue: true, awaitPromise: true
+            });
+
+            // Close model popup by pressing Escape
+            if (Input) {
+                await Input.dispatchKeyEvent({ type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+                await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+            }
+
+            await client.close();
+            const modelsFound = res.result?.value || [];
+            if (modelsFound.length > 1) {
+                return modelsFound;
+            }
+        } catch(e) {}
+    }
+    return [];
+}
+
+async function selectModel(port, modelName, specificTargetId = null) {
+    const raw = await resolveTargets(port, false);
+    let candidates = raw;
+    if (specificTargetId) {
+        const filtered = candidates.filter(t => t.id === specificTargetId); if (filtered.length > 0) candidates = filtered;
+    }
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime, Input } = client;
+            await Runtime.enable();
+
+            const evaluateScript = `
+                ${DriverFactory.getDriver().getLocatorsScript()}
+                (async () => {
+                    const rawTarget = ${JSON.stringify(modelName)};
+                    
+                    // Parse target: Effort tiers ONLY apply to Gemini models
+                    let targetEffort = null;
+                    let targetBase = rawTarget;
+                    if (/gemini/i.test(rawTarget)) {
+                        const effortMatch = rawTarget.match(/\\((Low|Medium|High)\\)$/i) || rawTarget.match(/\\b(low|medium|high)\\b$/i);
+                        if (effortMatch) {
+                            targetEffort = effortMatch[1].toLowerCase();
+                            targetBase = rawTarget.replace(/\\s*\\(?\\b(low|medium|high)\\b\\)?\\s*$/i, '').trim();
+                        }
+                    }
+
+                    const stripPunct = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+                    const targetBaseNorm = stripPunct(targetBase);
+
+                    const dispatchClick = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const clientX = rect.left + rect.width / 2;
+                        const clientY = rect.top + rect.height / 2;
+                        const screenX = window.screenX + clientX;
+                        const screenY = window.screenY + clientY;
+
+                        el.focus();
+                        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, composed: true, view: window, screenX, screenY, clientX, clientY, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+                        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, composed: true, view: window, screenX, screenY, clientX, clientY, button: 0 }));
+                        el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, composed: true, view: window, screenX, screenY, clientX, clientY, button: 0, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+                        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, composed: true, view: window, screenX, screenY, clientX, clientY, button: 0 }));
+                        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window, screenX, screenY, clientX, clientY, button: 0 }));
+                        try { el.click(); } catch(e) {}
+                        return true;
+                    };
+
+                    const dispatchHover = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        const clientX = rect.left + rect.width / 2;
+                        const clientY = rect.top + rect.height / 2;
+                        const screenX = window.screenX + clientX;
+                        const screenY = window.screenY + clientY;
+                        el.focus();
+                        el.dispatchEvent(new PointerEvent('pointerenter', { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, screenX, screenY, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+                        el.dispatchEvent(new PointerEvent('pointerover', { bubbles: true, cancelable: true, composed: true, view: window, clientX, clientY, screenX, screenY, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+                        el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true, clientX, clientY, screenX, screenY }));
+                        el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, clientX, clientY, screenX, screenY }));
+                        el.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, clientX, clientY, screenX, screenY }));
+                        el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true }));
+                        el.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true }));
+                        return true;
+                    };
+
+                    // Step 1: Ensure main model menu is open
+                    let btn = AG_UI.getModelSelectorButton();
+                    if (!btn) return { selected: false, reason: "no_selector_button" };
+
+                    let isAlreadyOpen = btn.getAttribute('aria-expanded') === 'true' || AG_UI.getModelOptions().filter(AG_UI.isVisible).length > 1;
+                    if (!isAlreadyOpen) {
+                        btn.focus();
+                        dispatchClick(btn);
+                        for (let i = 0; i < 10; i++) {
+                            await new Promise(r => setTimeout(r, 50));
+                            if (AG_UI.getModelOptions().filter(AG_UI.isVisible).length > 1) break;
+                        }
+                    }
+
+                    let candidateList = AG_UI.getModelOptions().filter(AG_UI.isVisible);
+                    if (candidateList.length === 0) {
+                        return { needCdpOpen: true };
+                    }
+
+                    // Find matching base item
+                    let matchedItem = candidateList.find(el => {
+                        const baseAttr = el.querySelector('[data-model-base]')?.getAttribute('data-model-base');
+                        if (baseAttr && stripPunct(baseAttr) === targetBaseNorm) return true;
+                        const labelAttr = el.getAttribute('data-model-label');
+                        if (labelAttr && stripPunct(labelAttr) === targetBaseNorm) return true;
+                        
+                        const innerSpan = el.querySelector('span.truncate span, span span') || el;
+                        const innerNorm = stripPunct(innerSpan.textContent);
+                        const fullNorm = stripPunct(el.textContent);
+
+                        return innerNorm === targetBaseNorm || 
+                               innerNorm.startsWith(targetBaseNorm) || 
+                               fullNorm === targetBaseNorm || 
+                               fullNorm.startsWith(targetBaseNorm);
+                    });
+
+                    if (!matchedItem) {
+                        return { selected: false, reason: "base_model_not_found", targetBase, available: candidateList.map(i => i.textContent.trim()) };
+                    }
+
+                    // Only Gemini models with explicit targetEffort need submenu handling
+                    if (targetEffort) {
+                        // Check if direct effort button exists inside item
+                        const directEffortBtn = Array.from(matchedItem.querySelectorAll('button, [role="button"], [role="menuitem"], [role="radio"], div[class*="cursor-pointer"], span[class*="cursor-pointer"]'))
+                            .find(el => {
+                                const t = (el.textContent || '').trim().toLowerCase();
+                                const attr = (el.getAttribute('data-effort') || el.getAttribute('data-tier') || '').trim().toLowerCase();
+                                return t === targetEffort || t.includes(targetEffort) || attr === targetEffort;
+                            });
+
+                        if (directEffortBtn) {
+                            dispatchClick(directEffortBtn);
+                            await new Promise(r => setTimeout(r, 150));
+                            return { selected: true, method: "direct_effort_child", base: targetBase, effort: targetEffort };
+                        }
+
+                        // Open submenu by hovering
+                        dispatchHover(matchedItem);
+
+                        // Wait for nested submenu
+                        let subOptions = [];
+                        const mainParent = matchedItem.closest('[role="menu"]') || matchedItem.closest('[data-testid="model-selector-panel"]');
+                        const mainId = mainParent ? mainParent.id : '';
+                        for (let i = 0; i < 12; i++) {
+                            await new Promise(r => setTimeout(r, 40));
+                            const subMenus = Array.from(document.querySelectorAll('[role="menu"][data-nested], [role="menu"], [data-radix-popper-content-wrapper], [data-radix-menu-content]'))
+                                .filter(el => el.offsetWidth > 0 && el.offsetHeight > 0 && el !== mainParent && (!mainId || el.id !== mainId));
+                            if (subMenus.length > 0) {
+                                for (const sm of subMenus) {
+                                    const items = Array.from(sm.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [data-radix-collection-item], div[data-base-ui-focusable], div[class*="cursor-pointer"], button'))
+                                        .filter(el => el.offsetWidth > 0 && (el.textContent || '').trim().length > 0 && !candidateList.includes(el));
+                                    if (items.length > 0) {
+                                        subOptions.push(...items);
+                                    }
+                                }
+                                if (subOptions.length > 0) break;
+                            }
+                        }
+
+                        if (subOptions.length > 0) {
+                            const effortOption = subOptions.find(opt => {
+                                const optText = (opt.textContent || '').trim().toLowerCase();
+                                const effortAttr = (opt.getAttribute('data-effort') || opt.getAttribute('data-tier') || '').trim().toLowerCase();
+                                const ariaLabel = (opt.getAttribute('aria-label') || '').trim().toLowerCase();
+                                return optText === targetEffort || 
+                                       optText.startsWith(targetEffort) || 
+                                       effortAttr === targetEffort || 
+                                       ariaLabel.startsWith(targetEffort);
+                            });
+
+                            if (effortOption) {
+                                dispatchClick(effortOption);
+                                await new Promise(r => setTimeout(r, 150));
+                                return { selected: true, method: "effort_submenu", base: targetBase, effort: targetEffort };
+                            }
+                        }
+                    }
+
+                    // Direct model click (Claude, GPT, or base Gemini)
+                    dispatchClick(matchedItem);
+                    await new Promise(r => setTimeout(r, 150));
+                    return { selected: true, method: "direct_click", model: matchedItem.textContent.trim() };
+                })()
+            `;
+
+            const selectRes = await Runtime.evaluate({ expression: evaluateScript, returnByValue: true, awaitPromise: true });
+            let selectVal = selectRes.result?.value;
+
+            // Fallback retry if menu was not opened
+            if (selectVal && selectVal.needCdpOpen && Input) {
+                await Input.dispatchKeyEvent({ type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                await Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+                await new Promise(r => setTimeout(r, 150));
+
+                const retryRes = await Runtime.evaluate({ expression: evaluateScript, returnByValue: true, awaitPromise: true });
+                selectVal = retryRes.result?.value;
+            }
+
+            await client.close();
+            if (selectVal && selectVal.selected) {
+                return true;
+            }
+        } catch(e) {}
+    }
+    return false;
+}
+
+async function stopAgent(port) {
+    const candidates = await resolveTargets(port, false);
+
+    for (const target of candidates) {
+        try {
+            const client = await CDP({ target: target.webSocketDebuggerUrl });
+            const { Runtime } = client;
+            await Runtime.enable();
+
+            const res = await Runtime.evaluate({
+                expression: `
+                    ${DriverFactory.getDriver().getLocatorsScript()}
+                    (() => {
+                        // First try the real stop button (agent generating)
+                        const btn = AG_UI.getStopButton();
+                        if (btn) {
+                            btn.click();
+                            return { stopped: true, method: 'stop' };
+                        }
+                        // Fallback: if an interactive modal is open, click Skip/Atla
+                        const chatArea = AG_UI.getVisibleChatContainer() || document;
+                        const allBtns = Array.from(chatArea.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+                        const skipBtn = allBtns.find(b => {
+                            const t = (b.textContent || '').trim().toLowerCase();
+                            return t === 'skip' || t === 'atla';
+                        });
+                        if (skipBtn) {
+                            skipBtn.click();
+                            return { stopped: true, method: 'skip' };
+                        }
+                        return { stopped: false };
+                    })()
+                `, returnByValue: true
+            });
+
+            await client.close();
+            return res.result?.value?.stopped || false;
+        } catch(e) {}
+    }
+    return false;
+}
+
+async function getQuota(_port, t, returnRaw = false) {
+    const { exec } = require('child_process');
+    const { promisify } = require('util');
+    const https = require('https');
+    const execAsync = promisify(exec);
+
+    try {
+        // 1. Detect Antigravity language server process and extract csrf_token + ports
+        const { stdout } = await execAsync('ps aux');
+        const psLines = stdout.split('\n');
+        let csrfToken = null;
+        let lsPid = null;
+
+        for (const line of psLines) {
+            if (!line.toLowerCase().includes('antigravity') && !line.includes('--csrf_token')) continue;
+            if (line.includes('grep')) continue;
+            const csrfMatch = line.match(/--csrf_token\s+([^\s]+)/) || line.match(/--csrf-token\s+([^\s]+)/);
+            if (csrfMatch) csrfToken = csrfMatch[1];
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 2) lsPid = parseInt(parts[1], 10);
+            if (csrfToken) break;
+        }
+
+        if (!csrfToken || !lsPid) {
+            console.log('[Quota] Language server not found');
+            return null;
+        }
+        console.log(`[Quota] LS found: PID=${lsPid}, token=${csrfToken.substring(0, 8)}...`);
+
+        // 2. Discover ports the language server is listening on
+        let ports = [];
+        try {
+            const { stdout: ssOut } = await execAsync(`ss -tlnp | grep "pid=${lsPid},"`);
+            for (const l of ssOut.split('\n')) {
+                const m = l.match(/:(\d+)\s/);
+                if (m) { const p = parseInt(m[1], 10); if (!isNaN(p) && !ports.includes(p)) ports.push(p); }
+            }
+        } catch(e) {
+            try {
+                const { stdout: lsofOut } = await execAsync(`lsof -nP -iTCP -sTCP:LISTEN -a -p ${lsPid}`);
+                for (const l of lsofOut.split('\n')) {
+                    const m = l.match(/:(\d+)\s+\(LISTEN\)/);
+                    if (m) { const p = parseInt(m[1], 10); if (!isNaN(p) && !ports.includes(p)) ports.push(p); }
+                }
+            } catch(e2) {}
+        }
+
+        if (ports.length === 0) { console.log('[Quota] LS port not found'); return null; }
+        console.log(`[Quota] Portlar: ${ports.join(', ')}`);
+
+        // 3. Probe ports with Connect RPC GetUserStatus
+        const RPC_PATH = '/exa.language_server_pb.LanguageServerService/GetUserStatus';
+        const body = JSON.stringify({ metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'en' } });
+
+        function probePort(p, protocol) {
+            return new Promise((resolve) => {
+                const mod = protocol === 'https' ? https : http;
+                const req = mod.request({
+                    hostname: '127.0.0.1', port: p, path: RPC_PATH, method: 'POST',
+                    timeout: 3000, rejectUnauthorized: false,
+                    headers: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'X-Codeium-Csrf-Token': csrfToken }
+                }, (res) => {
+                    let d = '';
+                    res.on('data', c => d += c);
+                    res.on('end', () => {
+                        if (res.statusCode >= 200 && res.statusCode < 300) {
+                            try { resolve(JSON.parse(d)); } catch(e) { resolve(null); }
+                        } else { resolve(null); }
+                    });
+                });
+                req.on('error', () => resolve(null));
+                req.on('timeout', () => { req.destroy(); resolve(null); });
+                req.write(body);
+                req.end();
+            });
+        }
+
+        let apiData = null;
+        for (const p of ports) {
+            apiData = await probePort(p, 'https');
+            if (apiData) break;
+            apiData = await probePort(p, 'http');
+            if (apiData) break;
+        }
+
+        if (!apiData) { console.log('[Quota] No Connect RPC response'); return null; }
+        console.log('[Quota] API response received');
+        if (returnRaw) return apiData;
+
+        // 4. Format the response
+        const userStatus = apiData.userStatus || apiData;
+        const result = [];
+
+        result.push(t ? t('quota.header') : '📊 Hesap ve Kota Bilgisi\n');
+        if (userStatus.email) result.push(`👤 ${userStatus.email}`);
+
+        // AI Credits from userTier.availableCredits
+        const userTier = userStatus.userTier;
+        if (userTier) {
+            if (userTier.name) result.push(t ? t('quota.plan', { plan: userTier.name }) : `📋 Plan: ${userTier.name}`);
+            const credits = userTier.availableCredits;
+            if (Array.isArray(credits) && credits.length > 0) {
+                const c = credits[0];
+                const amount = parseInt(c.creditAmount, 10);
+                if (!isNaN(amount)) {
+                    result.push(`💰 AI Credits: ${amount.toLocaleString()}`);
+                }
+            }
+        }
+
+        // Prompt Credits
+        const planStatus = userStatus.planStatus;
+        if (planStatus && typeof planStatus.availablePromptCredits === 'number') {
+            const availStr = planStatus.availablePromptCredits.toLocaleString();
+            const monthlyStr = planStatus.planInfo?.monthlyPromptCredits ? ` / ${planStatus.planInfo.monthlyPromptCredits.toLocaleString()}` : '';
+            result.push(t ? t('quota.prompt_credits', { available: availStr, monthly: monthlyStr }) : `📊 Prompt Credits: ${availStr}${monthlyStr}`);
+        }
+
+        const configs = userStatus.cascadeModelConfigData?.clientModelConfigs;
+        if (Array.isArray(configs) && configs.length > 0) {
+            result.push('');
+            result.push(t ? t('quota.model_quota') : '⏱️ Model Kota Durumu:');
+
+            // Sort models: Gemini > Claude > others
+            const priority = (label) => {
+                if (label.includes('Gemini')) return 0;
+                if (label.includes('Claude')) return 1;
+                return 2;
+            };
+            const sorted = [...configs].sort((a, b) => priority(a.label || '') - priority(b.label || ''));
+
+            for (const m of sorted) {
+                const modelId = m.modelOrAlias?.model || 'unknown';
+                const label = m.label || modelId;
+                // Skip autocomplete models and GPT-OSS
+                if (modelId.toLowerCase().includes('autocomplete') || modelId.toLowerCase().includes('inline')) continue;
+                if (modelId.includes('GPT_OSS') || label.includes('GPT-OSS') || label.includes('GPT OSS')) continue;
+                // Skip redundant Medium/Low tiers to keep the list clean
+                if (label.includes('(Medium)') || label.includes('(Low)')) continue;
+
+                let line = `🤖 ${label}`;
+                if (m.quotaInfo) {
+                    const rem = m.quotaInfo.remainingFraction;
+                    if (rem !== undefined) {
+                        const pct = Math.round(rem * 100);
+                        const bars = Math.round(rem * 8);
+                        const filled = '█'.repeat(bars);
+                        const empty = '▒'.repeat(8 - bars);
+                        let icon = '🟢';
+                        if (pct < 50) icon = '🟡';
+                        if (pct < 15) icon = '🔴';
+                        line += t ? t('quota.remaining_pct', { pct: pct, icon: icon, filled: filled, empty: empty }) : ` ${icon} ${filled}${empty} ${pct}% remaining`;
+                    }
+                    if (m.quotaInfo.resetTime) {
+                        try {
+                            const rt = new Date(m.quotaInfo.resetTime);
+                            const diff = rt - new Date();
+                            if (diff > 0) {
+                                const hrs = Math.floor(diff / 3600000);
+                                const mins = Math.floor((diff % 3600000) / 60000);
+                                line += t ? t('quota.reset_time', { hours: hrs, mins: mins }) : ` ⏳ ${hrs}sa ${mins}dk`;
+                            }
+                        } catch(e) {}
+                    }
+                    if (rem === 0) line += t ? t('quota.empty') : ' ⛔ EXHAUSTED';
+                }
+                result.push(line);
+            }
+        }
+
+        return result.length > 0 ? result.join('\n') : null;
+    } catch(e) {
+        console.error('[Quota] Hata:', e.message);
+        return null;
+    }
+}
+
+async function closeWindow(port) {
+    const candidates = await resolveTargets(port, false);
+    if (candidates.length === 0) return false;
+
+    const target = candidates[0]; // first candidate is the preferred window if set
+    const targetId = target.id;
+
+    // Stage 1: Graceful close via window.close()
+    // This triggers Electron's beforeunload/close event handlers,
+    // which flush state.vscdb (chat history, settings) to disk.
+    // Without this, Target.closeTarget kills the window instantly
+    // and Electron may not persist its internal state.
+    let gracefulOk = false;
+    try {
+        const client = await CDP({ target: target.webSocketDebuggerUrl });
+        const { Runtime } = client;
+        await Runtime.enable();
+        await Runtime.evaluate({ expression: 'window.close()' });
+        await client.close();
+        gracefulOk = true;
+        console.log(`[closeWindow] Stage 1: window.close() sent to ${targetId.substring(0, 8)}`);
+    } catch (e) {
+        console.log(`[closeWindow] Stage 1 failed (${e.message}), proceeding to fallback`);
+    }
+
+    // Wait for Electron to flush state to disk (state.vscdb write)
+    // 2 seconds is generous — typical flush takes <500ms
+    if (gracefulOk) {
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // Stage 2: Verify the window is gone, force-close if still alive
+    try {
+        const currentTargets = await resolveTargets(port, false).catch(() => []);
+        const stillAlive = currentTargets.some(t => t.id === targetId);
+
+        if (stillAlive) {
+            console.log(`[closeWindow] Stage 2: window still alive, force-closing via Target.closeTarget`);
+            try {
+                const client2 = await CDP({ port });
+                const { Target } = client2;
+                await Target.closeTarget({ targetId });
+                await client2.close();
+            } catch (e2) {
+                console.log(`[closeWindow] Target.closeTarget fallback failed: ${e2.message}`);
+            }
+        } else {
+            console.log(`[closeWindow] Window closed gracefully`);
+        }
+    } catch (_) {}
+
+    if (preferredTargetId === targetId) {
+        preferredTargetId = null;
+    }
+    return true;
+}
+
+async function closeAllEditors(port) {
+    const activeTarget = await resolveTargets(port, true);
+    if (!activeTarget) throw new Error("No active workspace found.");
+    
+    const client = await CDP({ port, target: activeTarget.webSocketDebuggerUrl });
+    const { Runtime } = client;
+    await Runtime.enable();
+    
+    const count = await Runtime.evaluate({
+        expression: `
+            (function() {
+                const tabs = document.querySelectorAll('.tab [title^="Close"], .tab [aria-label^="Close"]');
+                let c = 0;
+                tabs.forEach(t => { t.click(); c++; });
+                return c;
+            })()
+        `, returnByValue: true
+    });
+    await client.close();
+    return count?.result?.value || 0;
+}

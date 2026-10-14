@@ -1,0 +1,19 @@
+# ====================================================================
+# Coucou Bridge - Pengaturan Domain Publik (Cloudflare Tunnel)
+# ====================================================================
+#
+# Petunjuk Penggunaan:
+# 1. Salin (copy) file ini dan beri nama: domain.txt
+# 2. Masukkan alamat URL domain Cloudflare Tunnel kamu di bawah ini (1 baris saja).
+# 3. Simpan file, lalu jalankan atau restart Coucou Bridge.
+#
+# Catatan:
+# - Jika file domain.txt tidak ada atau dibiarkan kosong, Coucou Bridge
+#   akan otomatis menggunakan IP LAN Wi-Fi lokal (http://192.168.x.x:9335).
+# - Jangan pernah melakukan commit file domain.txt asli ke GitHub!
+#
+# Contoh:
+# https://coucou.domainkamu.com
+# https://nama-tunnel.trycloudflare.com
+
+https://coucou.domainkamu.com

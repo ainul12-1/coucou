@@ -1,0 +1,14 @@
+{
+  "name": "coucou-antigravity-bridge",
+  "version": "1.0.0",
+  "description": "Bridge between Coucou and Antigravity IDE via Chrome DevTools Protocol",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.34.0",
+    "qrcode": "^1.5.4"
+  }
+}
