@@ -599,10 +599,9 @@ type LocalId = "ollama" | "lmstudio" | "custom";
 let localRedraw: (() => void) | null = null;
 
 const LOCAL: Record<LocalId, { name: string; usual: string }> = {
+  custom: { name: "Google Antigravity IDE", usual: "http://127.0.0.1:9335" },
   ollama: { name: "Ollama", usual: "http://127.0.0.1:11434" },
   lmstudio: { name: "LM Studio", usual: "http://127.0.0.1:1234" },
-  // No usual address: any server that speaks the OpenAI API.
-  custom: { name: N_("OpenAI-compatible"), usual: "" },
 };
 
 /** What an address means for the user's data, as a hint line. */
@@ -1296,6 +1295,12 @@ async function main() {
   if (boot) {
     settings = { ...settings, ...boot.settings };
     version = boot.version;
+  }
+  if (!settings.customUrl) {
+    settings.customUrl = "http://127.0.0.1:9335";
+    if (settings.chatProvider === "anthropic" || !settings.chatProvider) {
+      settings.chatProvider = "custom";
+    }
   }
   setLanguage(resolveLanguage(settings.language, systemLanguages()));
   applyDirection();

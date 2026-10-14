@@ -514,8 +514,11 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
     if (activeTab === "public") renderActive();
   };
 
-  // If publicLink is already present from Rust, use it; otherwise fetch from bridge server
-  if (!publicLinkText) {
+  // Check localStorage for saved public domain first, then fallback to bridge /domain
+  const savedDomain = typeof localStorage !== "undefined" ? localStorage.getItem("coucou_public_domain") : null;
+  if (savedDomain) {
+    void generatePublicQr(savedDomain);
+  } else if (!publicLinkText) {
     void fetch("http://127.0.0.1:9335/domain")
       .then(res => res.json())
       .then(data => {
@@ -535,6 +538,34 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
   const tabLocal = h("button", { text: "Lokal (Wi-Fi)", style: "flex:1;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer" });
   const tabPublic = h("button", { text: "Publik (Cloudflare)", style: "flex:1;font-weight:600;padding:6px 12px;border-radius:6px;cursor:pointer" });
 
+  // Direct domain input row for non-technical users
+  const domainInput = h("input", {
+    type: "text",
+    placeholder: "Ketik domain Cloudflare (misal: coucou.namasaya.com)",
+    value: publicDomain || savedDomain || "",
+    style: "flex:1 1 auto;min-width:0;padding:6px 10px;border-radius:6px;background:#0f172a;border:1px solid #334155;color:#f8fafc;font-size:12.5px"
+  }) as HTMLInputElement;
+
+  const domainApplyBtn = h("button", {
+    class: "primary",
+    text: "Terapkan & Buat QR",
+    style: "padding:6px 14px;font-weight:600;white-space:nowrap"
+  });
+
+  const domainRow = h("div", {
+    class: "row",
+    style: "display:none;gap:8px;margin-top:6px;margin-bottom:6px"
+  }, domainInput, domainApplyBtn);
+
+  domainApplyBtn.addEventListener("click", () => {
+    let val = domainInput.value.trim();
+    val = val.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    if (val) {
+      if (typeof localStorage !== "undefined") localStorage.setItem("coucou_public_domain", val);
+      void generatePublicQr(val);
+    }
+  });
+
   const renderActive = () => {
     if (activeTab === "local") {
       tabLocal.style.background = "#2563eb";
@@ -543,6 +574,7 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
       tabPublic.style.background = "#1e293b";
       tabPublic.style.color = "#94a3b8";
       tabPublic.style.border = "1px solid #334155";
+      domainRow.style.display = "none";
 
       qr.innerHTML = pairing.qrSvg;
       link.value = pairing.link;
@@ -554,15 +586,16 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
       tabPublic.style.background = "#2563eb";
       tabPublic.style.color = "#ffffff";
       tabPublic.style.border = "1px solid #3b82f6";
+      domainRow.style.display = "flex";
 
       if (publicLinkText && publicQrSvgText) {
         qr.innerHTML = publicQrSvgText;
         link.value = publicLinkText;
         hintText.textContent = `Mode Publik: Gunakan saat di luar rumah via Cloudflare (${publicDomain}:443).`;
       } else {
-        qr.innerHTML = `<div style="padding:40px 16px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.5">Memuat atau belum ada domain publik terkonfigurasi.<br>Pastikan domain.txt diisi dan bridge berjalan di port 9335.</div>`;
+        qr.innerHTML = `<div style="padding:32px 16px;text-align:center;color:#94a3b8;font-size:13px;line-height:1.5">Masukkan alamat domain Cloudflare Tunnel Anda pada kotak di bawah ini, lalu klik "Terapkan & Buat QR".</div>`;
         link.value = "";
-        hintText.textContent = "Atur domain publik di windows/bridge/domain.txt untuk mengaktifkan QR Publik.";
+        hintText.textContent = "Ketik domain publik Anda di bawah untuk mengaktifkan QR Publik.";
       }
     }
   };
@@ -598,6 +631,7 @@ function pairingRows(pairing: PhoneLinkPairing, again: () => void): HTMLElement[
     tabsRow,
     hintText,
     qr,
+    domainRow,
     h("div", { class: "row" }, link, copy),
     copied,
     ...(pairing.relay ? [h("div", { class: "hint", text: t("This code also carries the access key and the end-to-end key for the relay {host}. Pair again makes a new key and a new room.", { host: pairing.relay }) })] : []),
